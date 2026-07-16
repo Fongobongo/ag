@@ -128,6 +128,9 @@ pub struct NodeView {
     pub max_concurrency: u32,
     pub active_attempts: u32,
     pub last_heartbeat_at: String,
+    pub agent_version: String,
+    pub load_avg: f64,
+    pub free_disk_mb: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +157,62 @@ pub struct Assignment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelState {
     pub cancel_requested: bool,
+}
+
+/// One-time enrollment token issued by an admin (TTL 10 min, only hash stored).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollTokenResponse {
+    pub token: String,
+    pub expires_at: String,
+}
+
+/// Exchange an enrollment token for a permanent node credential.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollRequest {
+    pub token: String,
+    pub name: String,
+    #[serde(default)]
+    pub adapters: Vec<String>,
+    #[serde(default)]
+    pub repositories: Vec<String>,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub agent_version: String,
+}
+
+/// Node identity + secret credential returned once at enroll (never stored plaintext).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollResponse {
+    pub node_id: String,
+    pub credential: String,
+}
+
+/// Periodic node health/capability report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    #[serde(default)]
+    pub status: Option<NodeStatus>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub adapters: Vec<String>,
+    #[serde(default)]
+    pub repositories: Vec<String>,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: u32,
+    #[serde(default)]
+    pub agent_version: String,
+    #[serde(default)]
+    pub load_avg: f64,
+    #[serde(default)]
+    pub free_disk_mb: u64,
+    #[serde(default)]
+    pub active_attempts: u32,
+}
+
+fn default_max_concurrency() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,5 +306,35 @@ mod tests {
             }),
         };
         assert_eq!(round_trip(&pr), pr);
+    }
+
+    #[test]
+    fn enroll_dto_round_trip() {
+        let er = EnrollRequest {
+            token: "t".into(),
+            name: "n".into(),
+            adapters: vec!["mock".into()],
+            repositories: vec!["*".into()],
+            max_concurrency: 2,
+            agent_version: "0.1".into(),
+        };
+        assert_eq!(round_trip(&er), er);
+        let hb = HeartbeatRequest {
+            status: Some(NodeStatus::Online),
+            name: "n".into(),
+            adapters: vec!["mock".into()],
+            repositories: vec!["*".into()],
+            max_concurrency: 2,
+            agent_version: "0.1".into(),
+            load_avg: 0.5,
+            free_disk_mb: 1024,
+            active_attempts: 1,
+        };
+        assert_eq!(round_trip(&hb), hb);
+        let resp = EnrollResponse {
+            node_id: "node-1".into(),
+            credential: "secret".into(),
+        };
+        assert_eq!(round_trip(&resp), resp);
     }
 }

@@ -3,6 +3,7 @@
 //! and reports completion. Stage-1 version: in-memory, mock adapter only.
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,10 +11,12 @@ use std::time::Duration;
 
 use agentgrid_adapters::{to_event_type, AdapterEvent};
 use agentgrid_common::{
-    Assignment, CancelState, CompleteAttemptRequest, EventType, IncomingEvent, IngestEventsRequest,
-    PollRequest, PollResponse,
+    Assignment, CancelState, CompleteAttemptRequest, EnrollRequest, EnrollResponse, EventType,
+    HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus, PollRequest, PollResponse,
 };
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -21,33 +24,70 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 #[derive(Clone)]
 struct Config {
     server: String,
-    node_id: String,
     node_name: String,
     workspace_root: PathBuf,
     max_concurrency: u32,
     adapter: String,
+    agent_version: String,
+    adapters: Vec<String>,
+    repositories: Vec<String>,
+    heartbeat_secs: u64,
+    enroll_token: Option<String>,
+    credential_path: PathBuf,
+}
+
+/// Node identity persisted to disk after enrollment (never re-sent in plaintext).
+#[derive(Serialize, Deserialize)]
+struct SavedCredential {
+    node_id: String,
+    credential: String,
+}
+
+fn split_csv(env: &str, default: &str) -> Vec<String> {
+    std::env::var(env)
+        .ok()
+        .and_then(|v| {
+            let items: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if items.is_empty() {
+                None
+            } else {
+                Some(items)
+            }
+        })
+        .unwrap_or_else(|| vec![default.to_string()])
 }
 
 fn config_from_env() -> Config {
-    let node_id =
-        std::env::var("AGENTGRID_NODE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    let node_name = std::env::var("AGENTGRID_NODE_NAME")
-        .unwrap_or_else(|_| hostname().unwrap_or_else(|| "node".into()));
-    let workspace_root = PathBuf::from(
-        std::env::var("AGENTGRID_WORKSPACE_ROOT")
-            .unwrap_or_else(|_| "./agentgrid-workspace".into()),
-    );
+    let data_dir =
+        std::env::var("AGENTGRID_DATA_DIR").unwrap_or_else(|_| "./agentgrid-data".into());
     Config {
         server: std::env::var("AGENTGRID_SERVER")
             .unwrap_or_else(|_| "http://127.0.0.1:7800".into()),
-        node_id,
-        node_name,
-        workspace_root,
+        node_name: std::env::var("AGENTGRID_NODE_NAME")
+            .unwrap_or_else(|_| hostname().unwrap_or_else(|| "node".into())),
+        workspace_root: PathBuf::from(
+            std::env::var("AGENTGRID_WORKSPACE_ROOT")
+                .unwrap_or_else(|_| "./agentgrid-workspace".into()),
+        ),
         max_concurrency: std::env::var("AGENTGRID_MAX_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2),
         adapter: std::env::var("AGENTGRID_ADAPTER").unwrap_or_else(|_| "adapter-mock".into()),
+        agent_version: std::env::var("AGENTGRID_AGENT_VERSION")
+            .unwrap_or_else(|_| "0.1.0-dev".into()),
+        adapters: split_csv("AGENTGRID_ADAPTERS", "mock"),
+        repositories: split_csv("AGENTGRID_REPOSITORIES", "*"),
+        heartbeat_secs: std::env::var("AGENTGRID_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+        enroll_token: std::env::var("AGENTGRID_ENROLL_TOKEN").ok(),
+        credential_path: PathBuf::from(data_dir).join("credential.json"),
     }
 }
 
@@ -231,11 +271,13 @@ fn terminate_group(pid: u32) {
         return;
     }
     unsafe {
+        // SAFETY: pid is a valid process-group id from our spawned child; SIGTERM is safe.
         libc::killpg(pid as i32, libc::SIGTERM);
     }
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(10));
         unsafe {
+            // SAFETY: same process group; SIGKILL after grace period is safe.
             libc::killpg(pid as i32, libc::SIGKILL);
         }
     });
@@ -249,16 +291,116 @@ async fn report_complete(client: &reqwest::Client, server: &str, attempt_id: &st
     }
 }
 
-async fn poll_loop(cfg: Config) -> Result<()> {
+/// Load a previously enrolled credential, or enroll a fresh one with the
+/// configured token and persist it for future starts.
+async fn load_or_enroll(cfg: &Config) -> Result<SavedCredential> {
+    if let Ok(s) = tokio::fs::read_to_string(&cfg.credential_path).await {
+        if let Ok(c) = serde_json::from_str::<SavedCredential>(&s) {
+            return Ok(c);
+        }
+    }
+    let token = cfg
+        .enroll_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no saved credential and AGENTGRID_ENROLL_TOKEN unset"))?;
     let client = reqwest::Client::new();
+    let req = EnrollRequest {
+        token,
+        name: cfg.node_name.clone(),
+        adapters: cfg.adapters.clone(),
+        repositories: cfg.repositories.clone(),
+        max_concurrency: cfg.max_concurrency,
+        agent_version: cfg.agent_version.clone(),
+    };
+    let resp = client
+        .post(format!("{}/v1/node/enroll", cfg.server))
+        .json(&req)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("enroll failed: {}", resp.status());
+    }
+    let er: EnrollResponse = resp.json().await?;
+    let saved = SavedCredential {
+        node_id: er.node_id,
+        credential: er.credential,
+    };
+    if let Some(parent) = cfg.credential_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&cfg.credential_path, serde_json::to_string(&saved)?).await?;
+    Ok(saved)
+}
+
+fn read_load_avg() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+fn read_free_disk_mb(path: &std::path::Path) -> u64 {
+    let cpath = match CString::new(path.to_string_lossy().as_bytes().to_vec()) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: stat is a valid, zeroed statvfs; cpath is a valid NUL-terminated path.
+    let free = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if free != 0 || stat.f_frsize == 0 {
+        return 0;
+    }
+    (stat.f_bavail as u64 * stat.f_frsize as u64) / (1024 * 1024)
+}
+
+async fn poll_loop(cfg: Config, cred: SavedCredential) -> Result<()> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", cred.credential))?,
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?;
     let sem = Arc::new(Semaphore::new(cfg.max_concurrency as usize));
+
+    // Heartbeat loop: publish status/load/capabilities periodically.
+    let hb_sem = sem.clone();
+    let hb_cfg = cfg.clone();
+    let hb_client = client.clone();
+    let hb_node_id = cred.node_id.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(hb_cfg.heartbeat_secs)).await;
+            let active = hb_cfg.max_concurrency - hb_sem.available_permits() as u32;
+            let req = HeartbeatRequest {
+                status: Some(NodeStatus::Online),
+                name: hb_cfg.node_name.clone(),
+                adapters: hb_cfg.adapters.clone(),
+                repositories: hb_cfg.repositories.clone(),
+                max_concurrency: hb_cfg.max_concurrency,
+                agent_version: hb_cfg.agent_version.clone(),
+                load_avg: read_load_avg(),
+                free_disk_mb: read_free_disk_mb(&hb_cfg.workspace_root),
+                active_attempts: active,
+            };
+            if let Err(e) = hb_client
+                .post(format!("{}/v1/node/heartbeat", hb_cfg.server))
+                .json(&req)
+                .send()
+                .await
+            {
+                tracing::warn!("heartbeat failed: {e}");
+            }
+        }
+    });
 
     loop {
         let poll_req = PollRequest {
-            node_id: cfg.node_id.clone(),
+            node_id: hb_node_id.clone(),
             name: cfg.node_name.clone(),
-            adapters: vec!["mock".into()],
-            repositories: vec!["*".into()],
+            adapters: cfg.adapters.clone(),
+            repositories: cfg.repositories.clone(),
             max_concurrency: cfg.max_concurrency,
         };
         let resp = client
@@ -318,11 +460,12 @@ async fn main() -> Result<()> {
 
     let cfg = config_from_env();
     tokio::fs::create_dir_all(&cfg.workspace_root).await?;
+    let cred = load_or_enroll(&cfg).await?;
     tracing::info!(
-        node_id = %cfg.node_id,
+        node_id = %cred.node_id,
         server = %cfg.server,
         adapter = %cfg.adapter,
         "node daemon starting"
     );
-    poll_loop(cfg).await
+    poll_loop(cfg, cred).await
 }

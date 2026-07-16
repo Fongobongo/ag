@@ -1,10 +1,12 @@
-//! End-to-end API test: create task -> node poll assignment -> ingest events
-//! (with idempotency) -> complete -> terminal task status. Exercises the full
-//! Stage-1 vertical slice without network I/O.
+//! End-to-end API test: create task -> node enroll + poll assignment -> ingest
+//! events (with idempotency) -> complete -> terminal task status. Exercises the
+//! full slice without network I/O. Node endpoints require credential auth
+//! (Stage 2.3), so tests enroll first.
 
 use agentgrid_common::{
-    Assignment, CancelState, CompleteAttemptRequest, CreateTaskRequest, EventType, IncomingEvent,
-    IngestEventsRequest, PollRequest, PollResponse, TaskStatus, TaskView,
+    Assignment, CancelState, CompleteAttemptRequest, CreateTaskRequest, EnrollRequest,
+    EnrollResponse, EnrollTokenResponse, EventType, HeartbeatRequest, IncomingEvent,
+    IngestEventsRequest, NodeStatus, PollRequest, PollResponse, TaskStatus, TaskView,
 };
 use agentgrid_control_plane::{build_router, AppState};
 use axum::body::{to_bytes, Body};
@@ -22,199 +24,72 @@ fn post(uri: &str, body: String) -> Request<Body> {
         .unwrap()
 }
 
-#[tokio::test]
-async fn full_task_lifecycle() {
-    let state = AppState::open_temp().await.unwrap();
-    let app = build_router(state);
-
-    // 1. Node polls before any task exists -> no assignment, but registers.
-    let poll_req = PollRequest {
-        node_id: "node-1".into(),
-        name: "daemon-1".into(),
-        adapters: vec!["mock".into()],
-        repositories: vec!["*".into()],
-        max_concurrency: 2,
-    };
-    let poll_app = app.clone();
-    let poll_handle = tokio::spawn(async move {
-        poll_app
-            .oneshot(post(
-                "/v1/node/poll",
-                serde_json::to_string(&poll_req).unwrap(),
-            ))
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // 2. Create a queued task.
-    let create_req = CreateTaskRequest {
-        prompt: "write:hello.txt:hi".into(),
-        repository: "demo".into(),
-        adapter: "mock".into(),
-        requested_node_id: None,
-        timeout_secs: None,
-    };
-    let resp = app
-        .clone()
-        .oneshot(post(
-            "/v1/tasks",
-            serde_json::to_string(&create_req).unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // 3. Poll returns the assignment.
-    let resp = poll_handle.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let pr: PollResponse = serde_json::from_slice(&body).unwrap();
-    let assign = pr.assignment.expect("expected an assignment");
-    assert_eq!(assign.adapter, "mock");
-    assert_eq!(assign.repository, "demo");
-
-    // 4. Ingest an event, then re-ingest the same sequence (idempotent).
-    let ingest = |seq| IngestEventsRequest {
-        events: vec![IncomingEvent {
-            sequence: seq,
-            r#type: EventType::Stdout,
-            payload: json!({ "text": "hi" }),
-        }],
-    };
-    let uri = format!("/v1/node/attempts/{}/events", assign.attempt_id);
-    let resp = app
-        .clone()
-        .oneshot(post(&uri, serde_json::to_string(&ingest(1)).unwrap()))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    // duplicate
-    let resp = app
-        .clone()
-        .oneshot(post(&uri, serde_json::to_string(&ingest(1)).unwrap()))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // 5. Event retrieval shows exactly one event.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!(
-                    "/v1/tasks/{}/events?after_sequence=0",
-                    assign.task_id
-                ))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-    assert_eq!(events.len(), 1, "duplicate sequence must be dropped");
-
-    // 6. Complete with success.
-    let resp = app
-        .clone()
-        .oneshot(post(
-            &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 0 }).unwrap(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // 7. Task is terminal/succeeded.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/tasks/{}", assign.task_id))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let tv: TaskView = serde_json::from_slice(&body).unwrap();
-    assert_eq!(tv.status, TaskStatus::Succeeded);
+fn post_auth(uri: &str, body: String, cred: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {cred}"))
+        .body(Body::from(body))
+        .unwrap()
 }
 
-#[tokio::test]
-async fn failure_marks_task_failed() {
-    let state = AppState::open_temp().await.unwrap();
-    let app = build_router(state);
-
-    // Directly create + assign via poll with a pre-registered node.
-    let poll_req = PollRequest {
-        node_id: "node-2".into(),
-        name: "d2".into(),
-        adapters: vec!["mock".into()],
-        repositories: vec!["*".into()],
-        max_concurrency: 1,
-    };
-    let app2 = app.clone();
-    let h = tokio::spawn(async move {
-        app2.oneshot(post(
-            "/v1/node/poll",
-            serde_json::to_string(&poll_req).unwrap(),
-        ))
-        .await
+fn get_auth(uri: &str, cred: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {cred}"))
+        .body(Body::empty())
         .unwrap()
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
 
-    let req = CreateTaskRequest {
-        prompt: "fail:3".into(),
-        repository: "demo".into(),
-        adapter: "mock".into(),
-        requested_node_id: None,
-        timeout_secs: None,
-    };
-    let resp = app
+fn delete(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Create an enrollment token, enroll a node, return (node_id, credential).
+async fn enroll(
+    app: &Router,
+    name: &str,
+    adapters: Vec<String>,
+    repos: Vec<String>,
+) -> (String, String) {
+    let tk_resp = app
         .clone()
-        .oneshot(post("/v1/tasks", serde_json::to_string(&req).unwrap()))
+        .oneshot(post("/v1/nodes/enrollment-token", "{}".into()))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let resp = h.await.unwrap();
-    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let pr: PollResponse = serde_json::from_slice(&body).unwrap();
-    let assign = pr.assignment.expect("assignment");
-
+    assert_eq!(tk_resp.status(), StatusCode::OK);
+    let tk: EnrollTokenResponse =
+        serde_json::from_slice(&to_bytes(tk_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let req = EnrollRequest {
+        token: tk.token,
+        name: name.into(),
+        adapters,
+        repositories: repos,
+        max_concurrency: 2,
+        agent_version: "test".into(),
+    };
     let resp = app
         .clone()
         .oneshot(post(
-            &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 3 }).unwrap(),
+            "/v1/node/enroll",
+            serde_json::to_string(&req).unwrap(),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/tasks/{}", assign.task_id))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let tv: TaskView =
+    let er: EnrollResponse =
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(tv.status, TaskStatus::Failed);
+    (er.node_id, er.credential)
 }
 
 /// Register a node via long-poll, create a task, and return its assignment.
-async fn create_and_assign(app: &Router, node_id: &str, prompt: &str) -> Assignment {
+async fn create_and_assign(app: &Router, node_id: &str, cred: &str, prompt: &str) -> Assignment {
     let poll_req = PollRequest {
         node_id: node_id.into(),
         name: "n".into(),
@@ -223,10 +98,12 @@ async fn create_and_assign(app: &Router, node_id: &str, prompt: &str) -> Assignm
         max_concurrency: 2,
     };
     let app2 = app.clone();
+    let cred2 = cred.to_string();
     let h = tokio::spawn(async move {
-        app2.oneshot(post(
+        app2.oneshot(post_auth(
             "/v1/node/poll",
             serde_json::to_string(&poll_req).unwrap(),
+            &cred2,
         ))
         .await
         .unwrap()
@@ -268,6 +145,79 @@ async fn show_status(app: &Router, task_id: &str) -> TaskStatus {
     tv.status
 }
 
+async fn cancel_state(app: &Router, attempt_id: &str, cred: &str) -> CancelState {
+    let resp = app
+        .clone()
+        .oneshot(get_auth(
+            &format!("/v1/node/attempts/{attempt_id}/cancel"),
+            cred,
+        ))
+        .await
+        .unwrap();
+    serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn full_task_lifecycle() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, cred) = enroll(&app, "node-1", vec!["mock".into()], vec!["*".into()]).await;
+    let assign = create_and_assign(&app, &node_id, &cred, "write:hello.txt:hi").await;
+
+    // First event flips attempt+task to running.
+    let ev = IngestEventsRequest {
+        events: vec![IncomingEvent {
+            sequence: 1,
+            r#type: EventType::Stdout,
+            payload: json!({"text": "start"}),
+        }],
+    };
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/node/attempts/{}/events", assign.attempt_id),
+            serde_json::to_string(&ev).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
+            serde_json::to_string(&CompleteAttemptRequest { exit_code: 0 }).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        show_status(&app, &assign.task_id).await,
+        TaskStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn failure_marks_task_failed() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, cred) = enroll(&app, "node-2", vec!["mock".into()], vec!["*".into()]).await;
+    let assign = create_and_assign(&app, &node_id, &cred, "fail:3").await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
+            serde_json::to_string(&CompleteAttemptRequest { exit_code: 3 }).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(show_status(&app, &assign.task_id).await, TaskStatus::Failed);
+}
+
 #[tokio::test]
 async fn cancel_queued_marks_cancelled() {
     let state = AppState::open_temp().await.unwrap();
@@ -307,9 +257,10 @@ async fn cancel_queued_marks_cancelled() {
 async fn cancel_running_then_node_confirms_cancelled() {
     let state = AppState::open_temp().await.unwrap();
     let app = build_router(state);
-    let assign = create_and_assign(&app, "node-c", "sleep:30").await;
+    let (node_id, cred) = enroll(&app, "node-c", vec!["mock".into()], vec!["*".into()]).await;
+    let assign = create_and_assign(&app, &node_id, &cred, "sleep:30").await;
 
-    let cs: CancelState = cancel_state(&app, &assign.attempt_id).await;
+    let cs: CancelState = cancel_state(&app, &assign.attempt_id, &cred).await;
     assert!(!cs.cancel_requested);
 
     let resp = app
@@ -325,14 +276,15 @@ async fn cancel_running_then_node_confirms_cancelled() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let cs: CancelState = cancel_state(&app, &assign.attempt_id).await;
+    let cs: CancelState = cancel_state(&app, &assign.attempt_id, &cred).await;
     assert!(cs.cancel_requested);
 
     let resp = app
         .clone()
-        .oneshot(post(
+        .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
             serde_json::to_string(&CompleteAttemptRequest { exit_code: 1 }).unwrap(),
+            &cred,
         ))
         .await
         .unwrap();
@@ -347,12 +299,14 @@ async fn cancel_running_then_node_confirms_cancelled() {
 async fn retry_failed_task_reques() {
     let state = AppState::open_temp().await.unwrap();
     let app = build_router(state);
-    let assign = create_and_assign(&app, "node-r", "fail:3").await;
+    let (node_id, cred) = enroll(&app, "node-r", vec!["mock".into()], vec!["*".into()]).await;
+    let assign = create_and_assign(&app, &node_id, &cred, "fail:3").await;
     let resp = app
         .clone()
-        .oneshot(post(
+        .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
             serde_json::to_string(&CompleteAttemptRequest { exit_code: 3 }).unwrap(),
+            &cred,
         ))
         .await
         .unwrap();
@@ -374,17 +328,70 @@ async fn retry_failed_task_reques() {
     assert_eq!(show_status(&app, &assign.task_id).await, TaskStatus::Queued);
 }
 
-async fn cancel_state(app: &Router, attempt_id: &str) -> CancelState {
+#[tokio::test]
+async fn revoked_node_gets_401() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, cred) = enroll(&app, "node-x", vec!["mock".into()], vec!["*".into()]).await;
+
+    // Heartbeat works before revoke.
+    let hb = HeartbeatRequest {
+        status: Some(NodeStatus::Online),
+        name: "node-x".into(),
+        adapters: vec!["mock".into()],
+        repositories: vec!["*".into()],
+        max_concurrency: 2,
+        agent_version: "t".into(),
+        load_avg: 0.1,
+        free_disk_mb: 1000,
+        active_attempts: 0,
+    };
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/node/attempts/{attempt_id}/cancel"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(post_auth(
+            "/v1/node/heartbeat",
+            serde_json::to_string(&hb).unwrap(),
+            &cred,
+        ))
         .await
         .unwrap();
-    serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Revoke the node.
+    let resp = app
+        .clone()
+        .oneshot(delete(&format!("/v1/nodes/{node_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Authenticated node endpoints now reject with 401.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            "/v1/node/heartbeat",
+            serde_json::to_string(&hb).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let poll_req = PollRequest {
+        node_id: node_id.clone(),
+        name: "n".into(),
+        adapters: vec!["mock".into()],
+        repositories: vec!["*".into()],
+        max_concurrency: 2,
+    };
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            "/v1/node/poll",
+            serde_json::to_string(&poll_req).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

@@ -32,6 +32,26 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - End-to-end on one machine: `task run` → mock adapter writes file → `succeeded`, logs stream.
 - Control-plane restart on the same SQLite file preserves queued tasks (WAL).
 
+### Added (Stage 2.3 — node lifecycle: enrollment, heartbeat, revoke)
+- Enrollment tokens: `POST /v1/nodes/enrollment-token` issues a one-time token
+  (TTL 10 min; only its SHA-256 hash is stored).
+- `POST /v1/node/enroll` exchanges a token for a permanent node credential
+  (random secret; only its hash stored). Token is single-use.
+- Node endpoints (`/v1/node/poll`, `/v1/node/heartbeat`, attempt events/complete/cancel)
+  require `Authorization: Bearer <credential>`; the control plane resolves the
+  credential to its node and rejects revoked/unknown ones with 401.
+- `POST /v1/node/heartbeat` publishes status, load, free disk, version and
+  capabilities; refreshes `last_heartbeat_at` (node-offline sweep unchanged).
+- `DELETE /v1/nodes/:id` revokes a node immediately (status `revoked`, auth denied).
+- Audit events logged for enroll/revoke.
+- Node daemon: enrolls on first start (token via `AGENTGRID_ENROLL_TOKEN`), persists
+  credential to `AGENTGRID_DATA_DIR/credential.json`, sends Bearer on every node
+  request, and runs a periodic heartbeat loop (load from `/proc/loadavg`, free disk
+  via `statvfs`).
+- CLI `token create` prints an enrollment token to export.
+- Schema migration `0003`: `enrollment_tokens`, `audit_events`, node `load_avg`/`free_disk_mb`.
+- Integration tests: enroll+auth flow; revoked node gets 401 on heartbeat and poll.
+
 ### Added (Stage 2.7 — cancellation + timeout)
 - `cancel_task`: `queued` → `cancelled` immediately; `assigned|running|validating` → sets
   `cancel_requested` on the attempt and reports `cancelled` once the node confirms completion.

@@ -10,13 +10,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agentgrid_common::{
-    CancelState, CompleteAttemptRequest, CreateTaskRequest, EventsQuery, IngestEventsRequest,
-    PollRequest, PollResponse, TaskView,
+    CancelState, CompleteAttemptRequest, CreateTaskRequest, EnrollRequest, EnrollResponse,
+    EnrollTokenResponse, EventsQuery, HeartbeatRequest, IngestEventsRequest, PollRequest,
+    PollResponse, TaskView,
 };
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    routing::{get, post},
+    body::Body,
+    extract::{Extension, Path, Query, State},
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::{delete, get, post},
     Json, Router,
 };
 use store::Store;
@@ -54,14 +58,56 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(show_task))
         .route("/v1/tasks/{id}/events", get(get_events))
-        .route("/v1/nodes", get(list_nodes))
-        .route("/v1/node/poll", post(poll))
         .route("/v1/tasks/{id}/cancel", post(cancel_task_handler))
         .route("/v1/tasks/{id}/retry", post(retry_task_handler))
+        .route("/v1/nodes", get(list_nodes))
+        .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
+        .route("/v1/nodes/{id}", delete(revoke_node))
+        .route("/v1/node/enroll", post(enroll))
+        .route("/v1/node/poll", post(poll))
+        .route("/v1/node/heartbeat", post(heartbeat))
         .route("/v1/node/attempts/{id}/cancel", get(attempt_cancel_handler))
         .route("/v1/node/attempts/{id}/events", post(ingest_events))
         .route("/v1/node/attempts/{id}/complete", post(complete_attempt))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_node_auth,
+        ))
         .with_state(state)
+}
+
+/// Node identity established by [`require_node_auth`]; read by node handlers.
+#[derive(Clone)]
+struct AuthedNode {
+    node_id: String,
+}
+
+/// Enforce Bearer node-credential auth on all `/v1/node/` routes except enroll.
+async fn require_node_auth(
+    State(state): State<Arc<AppState>>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/v1/node/") && path != "/v1/node/enroll" {
+        let cred = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        match cred {
+            Some(c) => match state.store.node_id_for_credential(c).await {
+                Ok(Some(node_id)) => {
+                    req.extensions_mut().insert(AuthedNode { node_id });
+                    Ok(next.run(req).await)
+                }
+                _ => Err(StatusCode::UNAUTHORIZED),
+            },
+            None => Err(StatusCode::UNAUTHORIZED),
+        }
+    } else {
+        Ok(next.run(req).await)
+    }
 }
 
 async fn health_live() -> StatusCode {
@@ -140,6 +186,60 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<agentgrid_co
     }
 }
 
+async fn create_enrollment_token(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<EnrollTokenResponse>, StatusCode> {
+    state
+        .store
+        .create_enrollment_token()
+        .await
+        .map(|(token, expires_at)| Json(EnrollTokenResponse { token, expires_at }))
+        .map_err(|e| {
+            tracing::error!("create_enrollment_token failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn enroll(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EnrollRequest>,
+) -> (StatusCode, Json<Option<EnrollResponse>>) {
+    match state.store.enroll_node(&req).await {
+        Ok(Some(r)) => (StatusCode::OK, Json(Some(r))),
+        Ok(None) => (StatusCode::BAD_REQUEST, Json(None)),
+        Err(e) => {
+            tracing::error!("enroll failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
+        }
+    }
+}
+
+async fn heartbeat(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthedNode>,
+    Json(req): Json<HeartbeatRequest>,
+) -> StatusCode {
+    match state.store.heartbeat(&auth.node_id, &req).await {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(e) => {
+            tracing::error!("heartbeat failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn revoke_node(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+    match state.store.revoke_node(&id).await {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(e) => {
+            tracing::error!("revoke_node failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 async fn get_events(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -156,8 +256,11 @@ async fn get_events(
 
 async fn poll(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<PollRequest>,
+    Extension(auth): Extension<AuthedNode>,
+    Json(mut req): Json<PollRequest>,
 ) -> (StatusCode, Json<PollResponse>) {
+    // The authenticated node id is the source of truth; ignore any client-supplied id.
+    req.node_id = auth.node_id;
     if let Err(e) = state.store.register_or_touch_node(&req).await {
         tracing::error!("register node failed: {e}");
         return (

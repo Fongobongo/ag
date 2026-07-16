@@ -23,6 +23,7 @@ chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+sha2.workspace = true
 agentgrid-common.workspace = true
 
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }

@@ -35,6 +35,8 @@ enum AgCommand {
     Cancel(CancelArgs),
     /// Retry a failed or cancelled task (back to queued).
     Retry(RetryArgs),
+    /// Node enrollment tokens.
+    Token(TokenArgs),
 }
 
 #[derive(Args)]
@@ -70,6 +72,18 @@ struct RetryArgs {
     task_id: String,
 }
 
+#[derive(Args)]
+struct TokenArgs {
+    #[command(subcommand)]
+    action: TokenAction,
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Issue a one-time enrollment token for a new node.
+    Create,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -83,6 +97,7 @@ async fn main() -> Result<()> {
         AgCommand::Nodes => cmd_node_list(&client, &base).await,
         AgCommand::Cancel(a) => cmd_cancel(&client, &base, a).await,
         AgCommand::Retry(a) => cmd_retry(&client, &base, a).await,
+        AgCommand::Token(a) => cmd_token(&client, &base, a).await,
     }
 }
 
@@ -231,5 +246,27 @@ async fn cmd_retry(client: &reqwest::Client, base: &str, a: RetryArgs) -> Result
         Ok(())
     } else {
         anyhow::bail!("retry failed ({})", resp.status())
+    }
+}
+
+async fn cmd_token(client: &reqwest::Client, base: &str, a: TokenArgs) -> Result<()> {
+    match a.action {
+        TokenAction::Create => {
+            let resp = client
+                .post(format!("{base}/v1/nodes/enrollment-token"))
+                .send()
+                .await
+                .context("enrollment-token request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("token creation failed ({})", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            let token = body
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            println!("export AGENTGRID_ENROLL_TOKEN={token}");
+            Ok(())
+        }
     }
 }

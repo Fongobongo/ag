@@ -47,6 +47,7 @@ dependencies = [
  "libsqlite3-sys",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tower",

@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use agentgrid_common::{
     next_attempt_status, next_task_status, Assignment, AttemptStatus, AttemptTransition,
-    CompleteAttemptRequest, CreateTaskRequest, EventType, IngestEventsRequest, NodeStatus,
-    NodeView, PollRequest, TaskEvent, TaskStatus, TaskTransition, TaskView,
+    CompleteAttemptRequest, CreateTaskRequest, EnrollRequest, EnrollResponse, EventType,
+    HeartbeatRequest, IngestEventsRequest, NodeStatus, NodeView, PollRequest, TaskEvent,
+    TaskStatus, TaskTransition, TaskView,
 };
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
@@ -45,6 +46,18 @@ fn from_snake<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 fn event_type_of(s: &str) -> EventType {
     from_snake(s).unwrap_or(EventType::Stdout)
 }
@@ -57,6 +70,13 @@ fn status_str(s: TaskStatus) -> String {
 }
 
 fn attempt_status_str(s: AttemptStatus) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+fn node_status_str(s: NodeStatus) -> String {
     serde_json::to_value(s)
         .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -82,6 +102,202 @@ impl Store {
 
     pub async fn health_check(&self) -> bool {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
+
+    // ----- enrollment + node auth (Stage 2.3) -----
+
+    /// Issue a one-time enrollment token (TTL 10 min). Only its hash is stored.
+    pub async fn create_enrollment_token(&self) -> Result<(String, String)> {
+        let token = Uuid::new_v4().to_string();
+        let hash = sha256_hex(&token);
+        let expires_at = iso_plus_secs(600);
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO enrollment_tokens (id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&hash)
+        .bind(&expires_at)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok((token, expires_at))
+    }
+
+    /// Exchange a valid (unused, unexpired) token for a permanent node credential.
+    pub async fn enroll_node(&self, req: &EnrollRequest) -> Result<Option<EnrollResponse>> {
+        let mut tx = self.pool.begin().await?;
+        let hash = sha256_hex(&req.token);
+        let tok = sqlx::query(
+            "SELECT id, expires_at, used_at FROM enrollment_tokens WHERE token_hash = ?",
+        )
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(tok) = tok else {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        };
+        let expires: String = tok.try_get("expires_at")?;
+        let used: Option<String> = tok.try_get("used_at")?;
+        if used.is_some() || expires < now_iso() {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        }
+        let node_id = Uuid::new_v4().to_string();
+        let credential = Uuid::new_v4().to_string();
+        let cred_hash = sha256_hex(&credential);
+        let now = now_iso();
+        let adapters = serde_json::to_string(&req.adapters)?;
+        let repos = serde_json::to_string(&req.repositories)?;
+        sqlx::query(
+            "INSERT INTO nodes (id, name, status, agent_version, max_concurrency, adapters, repositories, active_attempts, last_heartbeat_at, credential_hash, created_at) \
+             VALUES (?, ?, 'online', ?, ?, ?, ?, 0, ?, ?, ?)",
+        )
+        .bind(&node_id)
+        .bind(&req.name)
+        .bind(&req.agent_version)
+        .bind(req.max_concurrency as i64)
+        .bind(&adapters)
+        .bind(&repos)
+        .bind(&now)
+        .bind(&cred_hash)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE enrollment_tokens SET used_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(tok.try_get::<String, _>("id")?)
+            .execute(&mut *tx)
+            .await?;
+        self.audit_tx(&mut tx, "node", Some(&node_id), "enroll", None, None)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(EnrollResponse {
+            node_id,
+            credential,
+        }))
+    }
+
+    /// Resolve a node credential to its node id, or None if unknown or revoked.
+    pub async fn node_id_for_credential(&self, credential: &str) -> Result<Option<String>> {
+        let hash = sha256_hex(credential);
+        let row = sqlx::query("SELECT id, status FROM nodes WHERE credential_hash = ?")
+            .bind(&hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(r) => {
+                let status: String = r.try_get("status")?;
+                if status == "revoked" {
+                    None
+                } else {
+                    Some(r.try_get("id")?)
+                }
+            }
+            None => None,
+        })
+    }
+
+    /// Record a heartbeat: refresh capabilities/load and last-seen time.
+    pub async fn heartbeat(&self, node_id: &str, req: &HeartbeatRequest) -> Result<bool> {
+        let status = req.status.unwrap_or(NodeStatus::Online);
+        let adapters = serde_json::to_string(&req.adapters)?;
+        let repos = serde_json::to_string(&req.repositories)?;
+        let now = now_iso();
+        let affected = sqlx::query(
+            "UPDATE nodes SET name = ?, \
+               status = CASE WHEN status = 'revoked' THEN 'revoked' ELSE ? END, \
+               agent_version = ?, max_concurrency = ?, adapters = ?, repositories = ?, \
+               active_attempts = ?, load_avg = ?, free_disk_mb = ?, last_heartbeat_at = ? \
+             WHERE id = ?",
+        )
+        .bind(&req.name)
+        .bind(node_status_str(status))
+        .bind(&req.agent_version)
+        .bind(req.max_concurrency as i64)
+        .bind(&adapters)
+        .bind(&repos)
+        .bind(req.active_attempts as i64)
+        .bind(req.load_avg)
+        .bind(req.free_disk_mb as i64)
+        .bind(&now)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Revoke a node: reject its credential immediately, mark `revoked`.
+    pub async fn revoke_node(&self, node_id: &str) -> Result<bool> {
+        let now = now_iso();
+        let affected =
+            sqlx::query("UPDATE nodes SET status = 'revoked', revoked_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(node_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if affected == 1 {
+            self.audit("node", Some(node_id), "revoke", None, None)
+                .await?;
+        }
+        Ok(affected == 1)
+    }
+
+    pub async fn audit(
+        &self,
+        actor_type: &str,
+        actor_id: Option<&str>,
+        action: &str,
+        subject: Option<&str>,
+        payload: Option<&str>,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO audit_events (id, actor_type, actor_id, action, subject, payload, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(actor_type)
+        .bind(actor_id)
+        .bind(action)
+        .bind(subject)
+        .bind(payload)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn audit_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        actor_type: &str,
+        actor_id: Option<&str>,
+        action: &str,
+        subject: Option<&str>,
+        payload: Option<&str>,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO audit_events (id, actor_type, actor_id, action, subject, payload, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(actor_type)
+        .bind(actor_id)
+        .bind(action)
+        .bind(subject)
+        .bind(payload)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     pub async fn create_task(&self, req: &CreateTaskRequest) -> Result<TaskView> {
@@ -167,7 +383,7 @@ impl Store {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeView>> {
         let rows = sqlx::query(
-            "SELECT id, name, status, adapters, repositories, max_concurrency, active_attempts, last_heartbeat_at \
+            "SELECT id, name, status, adapters, repositories, max_concurrency, active_attempts, last_heartbeat_at, agent_version, load_avg, free_disk_mb \
              FROM nodes ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -613,5 +829,8 @@ fn row_to_node_view(r: &sqlx::sqlite::SqliteRow) -> NodeView {
         max_concurrency: r.try_get::<i64, _>("max_concurrency").unwrap_or(1) as u32,
         active_attempts: r.try_get::<i64, _>("active_attempts").unwrap_or(0) as u32,
         last_heartbeat_at: r.try_get("last_heartbeat_at").unwrap_or_default(),
+        agent_version: r.try_get("agent_version").unwrap_or_default(),
+        load_avg: r.try_get::<f64, _>("load_avg").unwrap_or(0.0),
+        free_disk_mb: r.try_get::<i64, _>("free_disk_mb").unwrap_or(0) as u64,
     }
 }
