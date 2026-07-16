@@ -787,6 +787,13 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        if let Some(ec) = &req.error_code {
+            sqlx::query("UPDATE attempts SET error_code = ? WHERE id = ?")
+                .bind(ec)
+                .bind(attempt_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?")
             .bind(status_str(task_target))
             .bind(&now)

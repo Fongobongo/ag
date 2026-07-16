@@ -32,6 +32,16 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - End-to-end on one machine: `task run` → mock adapter writes file → `succeeded`, logs stream.
 - Control-plane restart on the same SQLite file preserves queued tasks (WAL).
 
+### Added (Stage 3.3 / 3.4 — validation command + secret masking)
+- After the agent succeeds, the node runs `Assignment.validation_command` in the
+  worktree (diff already committed first, so it survives a failure); non-zero exit
+  reports `error_code=validation_failed`, distinct from `agent_failed`. Validation
+  output is streamed as events and saved as `validation.log` artifact.
+- Known secret substrings (env `AGENTGRID_SECRETS`, comma-separated) are masked to
+  `***` in streamed stdout/stderr before upload.
+- `CompleteAttemptRequest.error_code` recorded on the attempt.
+- Node-daemon tests: secret masking + validation exit code/log.
+
 ### Added (Stage 2.6 — events streaming, SSE)
 - `GET /v1/tasks/{id}/events/stream` Server-Sent-Events endpoint: streams existing and
   new attempt events (polls every 250ms, 15s keep-alive ping) for the web UI.

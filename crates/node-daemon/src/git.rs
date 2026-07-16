@@ -107,7 +107,7 @@ pub fn prepare_workspace(
 /// Commit any staged changes and write a binary diff (`changes.patch`) into the
 /// workspace. Returns the commit SHA (or current HEAD for no-op), None for
 /// plain-dir tasks.
-pub fn finalize_workspace(ws: &Workspace, committer_email: &str) -> Result<Option<String>> {
+pub fn finalize_workspace(ws: Workspace, committer_email: &str) -> Result<Option<String>> {
     let (repo_dir, branch) = match (&ws.repo_dir, &ws.branch) {
         (Some(r), Some(b)) => (r, b),
         _ => return Ok(None),
@@ -167,7 +167,7 @@ mod tests {
         let ws = prepare_workspace(&dir.join("repos"), &ws_root, &a).unwrap();
         assert!(!ws.is_git);
         assert!(ws.path.exists());
-        assert!(finalize_workspace(&ws, "n@x").unwrap().is_none());
+        assert!(finalize_workspace(ws, "n@x").unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -191,9 +191,10 @@ mod tests {
         // Agent writes a new file in the worktree.
         std::fs::write(ws.path.join("new.txt"), "hello").unwrap();
 
-        let sha = finalize_workspace(&ws, "agent@agentgrid").unwrap();
+        let patch_path = ws.path.join("changes.patch");
+        let sha = finalize_workspace(ws, "agent@agentgrid").unwrap();
         assert!(sha.is_some());
-        let patch = std::fs::read_to_string(ws.path.join("changes.patch")).unwrap();
+        let patch = std::fs::read_to_string(&patch_path).unwrap();
         assert!(patch.contains("new.txt"), "patch missing new file: {patch}");
         std::fs::remove_dir_all(&dir).ok();
     }

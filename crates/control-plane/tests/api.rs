@@ -191,6 +191,7 @@ async fn full_task_lifecycle() {
             serde_json::to_string(&CompleteAttemptRequest {
                 exit_code: 0,
                 commit_sha: None,
+                error_code: None,
             })
             .unwrap(),
             &cred,
@@ -217,6 +218,7 @@ async fn failure_marks_task_failed() {
             serde_json::to_string(&CompleteAttemptRequest {
                 exit_code: 3,
                 commit_sha: None,
+                error_code: None,
             })
             .unwrap(),
             &cred,
@@ -295,6 +297,7 @@ async fn cancel_running_then_node_confirms_cancelled() {
             serde_json::to_string(&CompleteAttemptRequest {
                 exit_code: 1,
                 commit_sha: None,
+                error_code: None,
             })
             .unwrap(),
             &cred,
@@ -321,6 +324,7 @@ async fn retry_failed_task_reques() {
             serde_json::to_string(&CompleteAttemptRequest {
                 exit_code: 3,
                 commit_sha: None,
+                error_code: None,
             })
             .unwrap(),
             &cred,
@@ -468,6 +472,7 @@ async fn artifact_upload_and_read() {
             serde_json::to_string(&CompleteAttemptRequest {
                 exit_code: 0,
                 commit_sha: None,
+                error_code: None,
             })
             .unwrap(),
             &cred,

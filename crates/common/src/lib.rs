@@ -247,6 +247,9 @@ pub struct CompleteAttemptRequest {
     /// Commit SHA produced by the attempt, if it ran in a git worktree.
     #[serde(default)]
     pub commit_sha: Option<String>,
+    /// Distinct failure category: `agent_failed` vs `validation_failed` etc.
+    #[serde(default)]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

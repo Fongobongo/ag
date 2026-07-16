@@ -38,6 +38,8 @@ struct Config {
     enroll_token: Option<String>,
     credential_path: PathBuf,
     repository_root: PathBuf,
+    /// Substrings masked to `***` in streamed logs (Stage 3.4).
+    secrets: Vec<String>,
 }
 
 /// Node identity persisted to disk after enrollment (never re-sent in plaintext).
@@ -96,6 +98,7 @@ fn config_from_env() -> Config {
             std::env::var("AGENTGRID_REPOSITORY_ROOT")
                 .unwrap_or_else(|_| "./agentgrid-repos".into()),
         ),
+        secrets: split_csv("AGENTGRID_SECRETS", ""),
     }
 }
 
@@ -169,10 +172,16 @@ impl EventSink {
     }
 }
 
-async fn read_stream<R: AsyncRead + Unpin>(reader: R, sink: Arc<EventSink>, stream: &str) {
+async fn read_stream<R: AsyncRead + Unpin>(
+    reader: R,
+    sink: Arc<EventSink>,
+    stream: &str,
+    secrets: Vec<String>,
+) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        match serde_json::from_str::<AdapterEvent>(&line) {
+        let masked = mask_secrets(&line, &secrets);
+        match serde_json::from_str::<AdapterEvent>(&masked) {
             Ok(ae) => sink.push(to_event_type(&ae.r#type), ae.payload).await,
             Err(_) => {
                 let ty = if stream == "stderr" {
@@ -209,7 +218,15 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         Ok(c) => c,
         Err(e) => {
             tracing::error!("failed to spawn adapter {}: {e}", cfg.adapter);
-            report_complete(&client, &cfg.server, &assignment.attempt_id, 127, None).await;
+            report_complete(
+                &client,
+                &cfg.server,
+                &assignment.attempt_id,
+                127,
+                None,
+                None,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -231,8 +248,18 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     );
     let flusher = tokio::spawn(sink.clone().run_flusher());
 
-    let r1 = tokio::spawn(read_stream(stdout, sink.clone(), "stdout"));
-    let r2 = tokio::spawn(read_stream(stderr, sink.clone(), "stderr"));
+    let r1 = tokio::spawn(read_stream(
+        stdout,
+        sink.clone(),
+        "stdout",
+        cfg.secrets.clone(),
+    ));
+    let r2 = tokio::spawn(read_stream(
+        stderr,
+        sink.clone(),
+        "stderr",
+        cfg.secrets.clone(),
+    ));
 
     enum Outcome {
         Exited(i32),
@@ -257,28 +284,50 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     flusher.abort();
 
     let node_name = cfg.node_name.clone();
-    let patch_path = ws.path.join("changes.patch");
+    let workdir = ws.path.clone();
+    let patch_path = workdir.join("changes.patch");
+    let validation_log = workdir.join("validation.log");
     let commit_sha =
-        tokio::task::spawn_blocking(move || git::finalize_workspace(&ws, &node_name)).await??;
+        tokio::task::spawn_blocking(move || git::finalize_workspace(ws, node_name.as_str()))
+            .await??;
 
-    // Upload produced artifacts (changes.patch for git-backed tasks).
-    if let Ok(content) = tokio::fs::read_to_string(&patch_path).await {
-        let req = UploadArtifactRequest {
-            name: "changes.patch".into(),
-            content,
-        };
-        if let Err(e) = client
-            .post(format!(
-                "{}/v1/node/attempts/{}/artifacts",
-                cfg.server, assignment.attempt_id
-            ))
-            .json(&req)
-            .send()
-            .await
-        {
-            tracing::warn!("artifact upload failed: {e}");
+    // Validation runs only when the agent itself succeeded (Stage 3.3); the
+    // diff is already committed so it survives a validation failure.
+    let mut error_code: Option<String> = if code == 0 {
+        None
+    } else {
+        Some("agent_failed".into())
+    };
+    if code == 0 {
+        if let Some(cmd) = &assignment.validation_command {
+            match run_validation(&workdir, cmd, &sink).await {
+                Ok(vcode) if vcode != 0 => error_code = Some("validation_failed".into()),
+                Err(e) => {
+                    tracing::error!("validation failed to run: {e}");
+                    error_code = Some("validation_failed".into());
+                }
+                _ => {}
+            }
         }
     }
+
+    // Upload produced artifacts (changes.patch for git tasks; validation.log).
+    upload_if_exists(
+        &client,
+        &cfg.server,
+        &assignment.attempt_id,
+        "changes.patch",
+        &patch_path,
+    )
+    .await;
+    upload_if_exists(
+        &client,
+        &cfg.server,
+        &assignment.attempt_id,
+        "validation.log",
+        &validation_log,
+    )
+    .await;
 
     tracing::info!(attempt_id = %assignment.attempt_id, exit_code = code, "attempt finished");
     report_complete(
@@ -287,12 +336,71 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         &assignment.attempt_id,
         code,
         commit_sha,
+        error_code,
     )
     .await;
     Ok(())
 }
 
+/// Run the post-agent validation command in the worktree, streaming its output
+/// as events and writing `validation.log`. Returns the command exit code.
+async fn run_validation(workdir: &std::path::Path, command: &str, sink: &EventSink) -> Result<i32> {
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{command} 2>&1"))
+        .current_dir(workdir)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().unwrap();
+    let mut log = String::new();
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await? {
+        sink.push(EventType::Stdout, json!({ "text": line })).await;
+        log.push_str(&line);
+        log.push('\n');
+    }
+    let status = child.wait().await?;
+    let code = status.code().unwrap_or(-1);
+    tokio::fs::write(workdir.join("validation.log"), &log).await?;
+    Ok(code)
+}
+
+/// Upload a local file as an artifact if it exists (idempotent per name).
+async fn upload_if_exists(
+    client: &reqwest::Client,
+    server: &str,
+    attempt_id: &str,
+    name: &str,
+    path: &std::path::Path,
+) {
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        let req = UploadArtifactRequest {
+            name: name.to_string(),
+            content,
+        };
+        if let Err(e) = client
+            .post(format!("{server}/v1/node/attempts/{attempt_id}/artifacts"))
+            .json(&req)
+            .send()
+            .await
+        {
+            tracing::warn!("artifact {name} upload failed: {e}");
+        }
+    }
+}
+
 /// Poll the control plane until cancellation is requested for this attempt.
+/// Replace any known secret substring with `***` (Stage 3.4).
+fn mask_secrets(line: &str, secrets: &Vec<String>) -> String {
+    let mut s = line.to_string();
+    for sec in secrets {
+        if !sec.is_empty() {
+            s = s.replace(sec, "***");
+        }
+    }
+    s
+}
+
 async fn wait_for_cancel(client: reqwest::Client, url: String) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -333,11 +441,13 @@ async fn report_complete(
     attempt_id: &str,
     exit_code: i32,
     commit_sha: Option<String>,
+    error_code: Option<String>,
 ) {
     let url = format!("{}/v1/node/attempts/{}/complete", server, attempt_id);
     let req = CompleteAttemptRequest {
         exit_code,
         commit_sha,
+        error_code,
     };
     if let Err(e) = client.post(&url).json(&req).send().await {
         tracing::warn!("complete report failed for {attempt_id}: {e}");
@@ -521,4 +631,36 @@ async fn main() -> Result<()> {
         "node daemon starting"
     );
     poll_loop(cfg, cred).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_secrets_replaces_known() {
+        assert_eq!(
+            mask_secrets("token=abc123", &vec!["abc123".to_string()]),
+            "token=***"
+        );
+        assert_eq!(mask_secrets("noop", &vec!["abc123".to_string()]), "noop");
+        assert_eq!(
+            mask_secrets("a secret b", &vec!["secret".to_string()]),
+            "a *** b"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_command_reports_exit_and_log() {
+        let dir = std::env::temp_dir().join(format!("ag-val-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = EventSink::new("a1".into(), reqwest::Client::new(), "http://x".into());
+        let code = run_validation(&dir, "echo hi; exit 2", &sink)
+            .await
+            .unwrap();
+        assert_eq!(code, 2);
+        let log = std::fs::read_to_string(dir.join("validation.log")).unwrap();
+        assert!(log.contains("hi"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
