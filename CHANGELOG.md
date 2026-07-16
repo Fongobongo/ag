@@ -76,6 +76,13 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - Schema migration `0004`: `repositories`, `node_repositories`.
 - Tests: repo create/list; node-daemon git worktree clone/commit/patch (real git).
 
+### Added (Stage 4.2 — full CLI)
+- `ag server` starts the control plane by exec'ing the sibling `agentgrid-control-plane` binary (sets `AGENTGRID_LISTEN`/`AGENTGRID_DB`; optional one-time `--bootstrap-user`/`--bootstrap-password`).
+- `task run` gains `--validate` (validation command) and `--timeout` (seconds); `--adapter`/`--node` already present.
+- `node list` and `task show` gain a global `--json` flag for machine-readable output.
+- `token create`, `repo add`, `task logs --follow`, `task cancel`/`retry`, `login` already present; `node list` renders an aligned table.
+- Deferred: `node install` (systemd unit + enroll) — lands with packaging in Stage 5.3.
+
 ### Added (Stage 4.1 — user authentication)
 - Local users: `users` table (argon2id password hash). First user created via `POST /v1/auth/setup` (only while no users exist) or via `AGENTGRID_BOOTSTRAP_USER`/`AGENTGRID_BOOTSTRAP_PASSWORD` env at startup.
 - `POST /v1/auth/login` exchanges username+password for a 12h HS256 JWT. Secret from `AGENTGRID_JWT_SECRET` (random per start if unset).

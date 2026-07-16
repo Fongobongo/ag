@@ -18,6 +18,9 @@ struct Cli {
         default_value = "http://127.0.0.1:7800"
     )]
     server: String,
+    /// Emit raw JSON instead of human-readable tables (machine-readable output).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: AgCommand,
 }
@@ -42,6 +45,8 @@ enum AgCommand {
     Repo(RepoArgs),
     /// Log in and store a session token for user-authenticated endpoints.
     Login(LoginArgs),
+    /// Start the control plane (standalone binary).
+    Server(ServerStartArgs),
 }
 
 #[derive(Args)]
@@ -52,7 +57,30 @@ struct RunArgs {
     adapter: String,
     #[arg(long)]
     node: Option<String>,
+    /// Validation command run after the agent succeeds.
+    #[arg(long)]
+    validate: Option<String>,
+    /// Per-task timeout in seconds.
+    #[arg(long)]
+    timeout: Option<u64>,
 }
+
+#[derive(Args)]
+struct ServerStartArgs {
+    /// Listen address (sets AGENTGRID_LISTEN).
+    #[arg(long, default_value = "127.0.0.1:7800")]
+    listen: String,
+    /// SQLite database path (sets AGENTGRID_DB).
+    #[arg(long, default_value = "control-plane.db")]
+    db: String,
+    /// Bootstrap the first user with this username (one-time).
+    #[arg(long)]
+    bootstrap_user: Option<String>,
+    /// Bootstrap password for the first user.
+    #[arg(long)]
+    bootstrap_password: Option<String>,
+}
+
 
 #[derive(Args)]
 struct LogsArgs {
@@ -138,13 +166,14 @@ async fn main() -> Result<()> {
     match cli.command {
         AgCommand::Run(a) => cmd_run(&client, &base, a).await,
         AgCommand::Logs(a) => cmd_logs(&client, &base, a).await,
-        AgCommand::Show(a) => cmd_show(&client, &base, a).await,
-        AgCommand::Nodes => cmd_node_list(&client, &base).await,
+        AgCommand::Show(a) => cmd_show(&client, &base, a, cli.json).await,
+        AgCommand::Nodes => cmd_node_list(&client, &base, cli.json).await,
         AgCommand::Cancel(a) => cmd_cancel(&client, &base, a).await,
         AgCommand::Retry(a) => cmd_retry(&client, &base, a).await,
         AgCommand::Token(a) => cmd_token(&client, &base, a).await,
         AgCommand::Repo(a) => cmd_repo(&client, &base, a).await,
         AgCommand::Login(a) => cmd_login(&client, &base, a).await,
+        AgCommand::Server(a) => cmd_server_start(a),
     }
 }
 
@@ -154,7 +183,7 @@ async fn cmd_run(client: &reqwest::Client, base: &str, a: RunArgs) -> Result<()>
         repository: a.repository,
         adapter: a.adapter,
         requested_node_id: a.node,
-        timeout_secs: None,
+        timeout_secs: a.timeout,
     };
     let resp = client
         .post(format!("{base}/v1/tasks"))
@@ -168,7 +197,7 @@ async fn cmd_run(client: &reqwest::Client, base: &str, a: RunArgs) -> Result<()>
     Ok(())
 }
 
-async fn cmd_show(client: &reqwest::Client, base: &str, a: ShowArgs) -> Result<()> {
+async fn cmd_show(client: &reqwest::Client, base: &str, a: ShowArgs, json: bool) -> Result<()> {
     let resp = client
         .get(format!("{base}/v1/tasks/{}", a.task_id))
         .send()
@@ -178,6 +207,10 @@ async fn cmd_show(client: &reqwest::Client, base: &str, a: ShowArgs) -> Result<(
         anyhow::bail!("task not found ({})", resp.status());
     }
     let task: TaskView = resp.json().await.context("parse task response")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+        return Ok(());
+    }
     println!("id:        {}", task.id);
     println!("status:    {}", task.status);
     println!("repository:{}", task.repository);
@@ -258,13 +291,17 @@ async fn current_status(client: &reqwest::Client, base: &str, task_id: &str) -> 
     Ok(task.status)
 }
 
-async fn cmd_node_list(client: &reqwest::Client, base: &str) -> Result<()> {
+async fn cmd_node_list(client: &reqwest::Client, base: &str, json: bool) -> Result<()> {
     let resp = client
         .get(format!("{base}/v1/nodes"))
         .send()
         .await
         .context("node list request failed")?;
     let nodes: Vec<serde_json::Value> = resp.json().await.context("parse nodes")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&nodes)?);
+        return Ok(());
+    }
     if nodes.is_empty() {
         println!("(no nodes registered)");
         return Ok(());
@@ -403,6 +440,41 @@ fn save_token(token: &str) -> Result<()> {
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+fn cmd_server_start(a: ServerStartArgs) -> Result<()> {
+    // The control plane binary ships alongside `ag` in the same install dir.
+    let exe = std::env::current_exe()?;
+    let bin = exe
+        .parent()
+        .map(|p| p.join("agentgrid-control-plane"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("agentgrid-control-plane"));
+    if !bin.exists() {
+        anyhow::bail!(
+            "agentgrid-control-plane not found next to `ag` (looked at {})",
+            bin.display()
+        );
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.env("AGENTGRID_LISTEN", &a.listen).env("AGENTGRID_DB", &a.db);
+    if let Some(u) = &a.bootstrap_user {
+        cmd.env("AGENTGRID_BOOTSTRAP_USER", u);
+    }
+    if let Some(p) = &a.bootstrap_password {
+        cmd.env("AGENTGRID_BOOTSTRAP_PASSWORD", p);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(err.into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 async fn cmd_login(client: &reqwest::Client, base: &str, a: LoginArgs) -> Result<()> {

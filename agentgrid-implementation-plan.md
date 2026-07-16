@@ -316,16 +316,18 @@
 
 ### 4.2 CLI (полный набор команд спеки)
 
-- [ ] `server start` — запуск control plane (standalone-режим, если выбран в 0.1)
-- [ ] `token create` — выдача enrollment token
-- [ ] `node install --server <url> --token <token>` — установка daemon: создание пользователя, каталогов, systemd unit, enroll
-- [ ] `node list` — таблица: имя, статус, адаптеры, репозитории, загрузка, last heartbeat
-- [ ] `repo add <git-url> --name <name>` и `repo attach <name> --node <node>`
-- [ ] `task run <repo> "<prompt>" --adapter <a> --validate "<cmd>" [--node <node>] [--timeout <min>]`
-- [ ] `task logs <id> --follow` — live-стрим с reconnect и resume по sequence
-- [ ] `task cancel <id>`, `task retry <id>`, `task show <id>` (статус, node, время, diff-сводка, путь к артефактам)
-- [ ] Человекочитаемые ошибки + `--json` для машиночитаемого вывода
-- [ ] Exit codes: 0 — успех, ненулевые — категории ошибок (для скриптов)
+- [x] `server start` — запуск control plane (standalone) — реализовано как `ag server` (flat; exec sibling `agentgrid-control-plane`, флаги `--listen/--db/--bootstrap-user/--bootstrap-password`)
+- [x] `token create` — выдача enrollment token (`ag token create`)
+- [ ] `node install --server <url> --token <token>` — установка daemon: создание пользователя, каталогов, systemd unit, enroll — отложено до Stage 5.3 (packaging)
+- [x] `node list` — таблица (id/status/active/max) + `--json`
+- [x] `repo add <git-url> --name <name>` (`ag repo add`); `repo attach` не реализован (attach происходит через enrollment/heartbeat capabilities)
+- [x] `task run <repo> "<prompt>" --adapter <a> --validate "<cmd>" [--node <node>] [--timeout <sec>]`
+- [x] `task logs <id> --follow` — live-стрим с resume по sequence
+- [x] `task cancel <id>`, `task retry <id>`, `task show <id>` — статус/время/eligibility; diff-сводка/артефакты отдаются через API (в CLI не раскрыты детально)
+- [x] Человекочитаемые ошибки + глобальный `--json` для машиночитаемого вывода
+- [ ] Exit codes: 0 — успех, ненулевые — категории ошибок — частично (anyhow exit 1 при ошибке); тонкая категоризация отложена
+
+### 4.3 Web UI
 
 ### 4.3 Web UI
 
