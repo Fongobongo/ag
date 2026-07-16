@@ -37,6 +37,8 @@ enum AgCommand {
     Retry(RetryArgs),
     /// Node enrollment tokens.
     Token(TokenArgs),
+    /// Manage repositories.
+    Repo(RepoArgs),
 }
 
 #[derive(Args)]
@@ -84,6 +86,31 @@ enum TokenAction {
     Create,
 }
 
+#[derive(Args)]
+struct RepoArgs {
+    #[command(subcommand)]
+    action: RepoAction,
+}
+
+#[derive(Subcommand)]
+enum RepoAction {
+    /// Register a repository.
+    Add(RepoAddArgs),
+}
+
+#[derive(Args)]
+struct RepoAddArgs {
+    name: String,
+    /// Git URL (https/token or local path).
+    git_url: String,
+    /// Default branch new attempts branch from.
+    #[arg(long, default_value = "main")]
+    branch: String,
+    /// Optional validation command run after the agent succeeds.
+    #[arg(long)]
+    validate: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -98,6 +125,7 @@ async fn main() -> Result<()> {
         AgCommand::Cancel(a) => cmd_cancel(&client, &base, a).await,
         AgCommand::Retry(a) => cmd_retry(&client, &base, a).await,
         AgCommand::Token(a) => cmd_token(&client, &base, a).await,
+        AgCommand::Repo(a) => cmd_repo(&client, &base, a).await,
     }
 }
 
@@ -246,6 +274,31 @@ async fn cmd_retry(client: &reqwest::Client, base: &str, a: RetryArgs) -> Result
         Ok(())
     } else {
         anyhow::bail!("retry failed ({})", resp.status())
+    }
+}
+
+async fn cmd_repo(client: &reqwest::Client, base: &str, a: RepoArgs) -> Result<()> {
+    match a.action {
+        RepoAction::Add(add) => {
+            let req = serde_json::json!({
+                "name": add.name,
+                "git_url": add.git_url,
+                "default_branch": add.branch,
+                "validation_command": add.validate,
+            });
+            let resp = client
+                .post(format!("{base}/v1/repositories"))
+                .json(&req)
+                .send()
+                .await
+                .context("repository registration failed")?;
+            if resp.status().is_success() {
+                println!("repository {} registered", add.name);
+                Ok(())
+            } else {
+                anyhow::bail!("repo add failed ({})", resp.status())
+            }
+        }
     }
 }
 

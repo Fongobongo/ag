@@ -32,6 +32,21 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - End-to-end on one machine: `task run` → mock adapter writes file → `succeeded`, logs stream.
 - Control-plane restart on the same SQLite file preserves queued tasks (WAL).
 
+### Added (Stage 2.5 — repositories + git worktrees)
+- `POST /v1/repositories` / `GET /v1/repositories`: register a repo (name, git_url,
+  default_branch, optional validation_command) and list them.
+- Assignment now carries `git_url`, `default_branch` and `validation_command`
+  (resolved from the registered repo) so the node can run in a real worktree.
+- Node daemon: keeps one clone per repo under `AGENTGRID_REPOSITORY_ROOT`, and for
+  git-backed tasks creates a per-attempt worktree on branch `agent/<task-id>/<n>`,
+  runs the adapter there, then commits changes (author `agentgrid`) and writes a
+  binary `changes.patch` into the workspace; the commit SHA is reported on complete.
+  Plain-dir tasks (no `git_url`) keep the old behaviour.
+- `CompleteAttemptRequest.commit_sha` recorded on the attempt.
+- CLI `repo add <name> <git-url> [--branch main] [--validate "cmd"]`.
+- Schema migration `0004`: `repositories`, `node_repositories`.
+- Tests: repo create/list; node-daemon git worktree clone/commit/patch (real git).
+
 ### Added (Stage 2.3 — node lifecycle: enrollment, heartbeat, revoke)
 - Enrollment tokens: `POST /v1/nodes/enrollment-token` issues a one-time token
   (TTL 10 min; only its SHA-256 hash is stored).

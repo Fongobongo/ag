@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agentgrid_common::{
-    CancelState, CompleteAttemptRequest, CreateTaskRequest, EnrollRequest, EnrollResponse,
-    EnrollTokenResponse, EventsQuery, HeartbeatRequest, IngestEventsRequest, PollRequest,
-    PollResponse, TaskView,
+    CancelState, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
+    EnrollResponse, EnrollTokenResponse, EventsQuery, HeartbeatRequest, IngestEventsRequest,
+    PollRequest, PollResponse, RepositoryView, TaskView,
 };
 use axum::{
     body::Body,
@@ -63,6 +63,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
         .route("/v1/nodes/{id}", delete(revoke_node))
+        .route(
+            "/v1/repositories",
+            post(create_repository).get(list_repositories),
+        )
         .route("/v1/node/enroll", post(enroll))
         .route("/v1/node/poll", post(poll))
         .route("/v1/node/heartbeat", post(heartbeat))
@@ -236,6 +240,39 @@ async fn revoke_node(State(state): State<Arc<AppState>>, Path(id): Path<String>)
         Err(e) => {
             tracing::error!("revoke_node failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn create_repository(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateRepositoryRequest>,
+) -> (StatusCode, Json<RepositoryView>) {
+    match state.store.create_repository(&req).await {
+        Ok(v) => (StatusCode::CREATED, Json(v)),
+        Err(e) => {
+            tracing::error!("create_repository failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RepositoryView {
+                    id: String::new(),
+                    name: String::new(),
+                    git_url: String::new(),
+                    default_branch: String::new(),
+                    validation_command: None,
+                    created_at: String::new(),
+                }),
+            )
+        }
+    }
+}
+
+async fn list_repositories(State(state): State<Arc<AppState>>) -> Json<Vec<RepositoryView>> {
+    match state.store.list_repositories().await {
+        Ok(r) => Json(r),
+        Err(e) => {
+            tracing::error!("list_repositories failed: {e}");
+            Json(vec![])
         }
     }
 }

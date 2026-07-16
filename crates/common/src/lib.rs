@@ -152,6 +152,15 @@ pub struct Assignment {
     pub number: u32,
     /// Seconds before the node should forcibly kill the attempt.
     pub timeout_secs: u64,
+    /// Git remote URL; empty when the task runs in a plain directory.
+    #[serde(default)]
+    pub git_url: String,
+    /// Branch new attempts branch from (e.g. `main`).
+    #[serde(default)]
+    pub default_branch: String,
+    /// Optional validation command run after the agent succeeds (Stage 3.3).
+    #[serde(default)]
+    pub validation_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +244,28 @@ pub struct IngestEventsRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteAttemptRequest {
     pub exit_code: i32,
+    /// Commit SHA produced by the attempt, if it ran in a git worktree.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateRepositoryRequest {
+    pub name: String,
+    pub git_url: String,
+    pub default_branch: String,
+    #[serde(default)]
+    pub validation_command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryView {
+    pub id: String,
+    pub name: String,
+    pub git_url: String,
+    pub default_branch: String,
+    pub validation_command: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -303,6 +334,9 @@ mod tests {
                 adapter: "mock".into(),
                 number: 1,
                 timeout_secs: 3600,
+                git_url: String::new(),
+                default_branch: String::new(),
+                validation_command: None,
             }),
         };
         assert_eq!(round_trip(&pr), pr);

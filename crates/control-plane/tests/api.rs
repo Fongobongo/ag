@@ -4,9 +4,10 @@
 //! (Stage 2.3), so tests enroll first.
 
 use agentgrid_common::{
-    Assignment, CancelState, CompleteAttemptRequest, CreateTaskRequest, EnrollRequest,
-    EnrollResponse, EnrollTokenResponse, EventType, HeartbeatRequest, IncomingEvent,
-    IngestEventsRequest, NodeStatus, PollRequest, PollResponse, TaskStatus, TaskView,
+    Assignment, CancelState, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest,
+    EnrollRequest, EnrollResponse, EnrollTokenResponse, EventType, HeartbeatRequest, IncomingEvent,
+    IngestEventsRequest, NodeStatus, PollRequest, PollResponse, RepositoryView, TaskStatus,
+    TaskView,
 };
 use agentgrid_control_plane::{build_router, AppState};
 use axum::body::{to_bytes, Body};
@@ -187,7 +188,11 @@ async fn full_task_lifecycle() {
         .clone()
         .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 0 }).unwrap(),
+            serde_json::to_string(&CompleteAttemptRequest {
+                exit_code: 0,
+                commit_sha: None,
+            })
+            .unwrap(),
             &cred,
         ))
         .await
@@ -209,7 +214,11 @@ async fn failure_marks_task_failed() {
         .clone()
         .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 3 }).unwrap(),
+            serde_json::to_string(&CompleteAttemptRequest {
+                exit_code: 3,
+                commit_sha: None,
+            })
+            .unwrap(),
             &cred,
         ))
         .await
@@ -283,7 +292,11 @@ async fn cancel_running_then_node_confirms_cancelled() {
         .clone()
         .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 1 }).unwrap(),
+            serde_json::to_string(&CompleteAttemptRequest {
+                exit_code: 1,
+                commit_sha: None,
+            })
+            .unwrap(),
             &cred,
         ))
         .await
@@ -305,7 +318,11 @@ async fn retry_failed_task_reques() {
         .clone()
         .oneshot(post_auth(
             &format!("/v1/node/attempts/{}/complete", assign.attempt_id),
-            serde_json::to_string(&CompleteAttemptRequest { exit_code: 3 }).unwrap(),
+            serde_json::to_string(&CompleteAttemptRequest {
+                exit_code: 3,
+                commit_sha: None,
+            })
+            .unwrap(),
             &cred,
         ))
         .await
@@ -394,4 +411,45 @@ async fn revoked_node_gets_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn repository_create_and_list() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let req = CreateRepositoryRequest {
+        name: "demo".into(),
+        git_url: "https://example.com/demo.git".into(),
+        default_branch: "main".into(),
+        validation_command: Some("cargo test".into()),
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/repositories",
+            serde_json::to_string(&req).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let rv: RepositoryView = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rv.name, "demo");
+    assert_eq!(rv.default_branch, "main");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/repositories")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let repos: Vec<RepositoryView> =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "demo");
 }

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use agentgrid_common::{
     next_attempt_status, next_task_status, Assignment, AttemptStatus, AttemptTransition,
-    CompleteAttemptRequest, CreateTaskRequest, EnrollRequest, EnrollResponse, EventType,
-    HeartbeatRequest, IngestEventsRequest, NodeStatus, NodeView, PollRequest, TaskEvent,
-    TaskStatus, TaskTransition, TaskView,
+    CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
+    EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest, NodeStatus, NodeView,
+    PollRequest, RepositoryView, TaskEvent, TaskStatus, TaskTransition, TaskView,
 };
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
@@ -381,6 +381,52 @@ impl Store {
         Ok(events)
     }
 
+    // ----- repositories (Stage 2.5) -----
+
+    pub async fn create_repository(&self, req: &CreateRepositoryRequest) -> Result<RepositoryView> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO repositories (id, name, git_url, default_branch, validation_command, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&req.name)
+        .bind(&req.git_url)
+        .bind(&req.default_branch)
+        .bind(&req.validation_command)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(RepositoryView {
+            id,
+            name: req.name.clone(),
+            git_url: req.git_url.clone(),
+            default_branch: req.default_branch.clone(),
+            validation_command: req.validation_command.clone(),
+            created_at: now,
+        })
+    }
+
+    pub async fn list_repositories(&self) -> Result<Vec<RepositoryView>> {
+        let rows = sqlx::query(
+            "SELECT id, name, git_url, default_branch, validation_command, created_at FROM repositories",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| RepositoryView {
+                id: r.try_get("id").unwrap_or_default(),
+                name: r.try_get("name").unwrap_or_default(),
+                git_url: r.try_get("git_url").unwrap_or_default(),
+                default_branch: r.try_get("default_branch").unwrap_or_default(),
+                validation_command: r.try_get("validation_command").unwrap_or_default(),
+                created_at: r.try_get("created_at").unwrap_or_default(),
+            })
+            .collect())
+    }
+
     pub async fn list_nodes(&self) -> Result<Vec<NodeView>> {
         let rows = sqlx::query(
             "SELECT id, name, status, adapters, repositories, max_concurrency, active_attempts, last_heartbeat_at, agent_version, load_avg, free_disk_mb \
@@ -440,6 +486,22 @@ impl Store {
         let adapter: String = c.try_get("adapter")?;
         let repository: String = c.try_get("repository")?;
         let timeout_secs: i64 = c.try_get("timeout_secs")?;
+
+        // Resolve repository git info (absent for plain-dir tasks).
+        let repo = sqlx::query(
+            "SELECT git_url, default_branch, validation_command FROM repositories WHERE name = ?",
+        )
+        .bind(&repository)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (git_url, default_branch, validation_command) = match repo {
+            Some(r) => (
+                r.try_get::<String, _>("git_url")?,
+                r.try_get::<String, _>("default_branch")?,
+                r.try_get::<Option<String>, _>("validation_command")?,
+            ),
+            None => (String::new(), String::new(), None),
+        };
 
         let node = sqlx::query(
             "SELECT status, adapters, repositories, max_concurrency, active_attempts FROM nodes WHERE id = ?",
@@ -518,6 +580,9 @@ impl Store {
             adapter,
             number: number as u32,
             timeout_secs: timeout_secs as u64,
+            git_url,
+            default_branch,
+            validation_command,
         }))
     }
 
@@ -656,6 +721,13 @@ impl Store {
             .bind(attempt_id)
             .execute(&mut *tx)
             .await?;
+        if let Some(sha) = &req.commit_sha {
+            sqlx::query("UPDATE attempts SET commit_sha = ? WHERE id = ?")
+                .bind(sha)
+                .bind(attempt_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?")
             .bind(status_str(task_target))
             .bind(&now)

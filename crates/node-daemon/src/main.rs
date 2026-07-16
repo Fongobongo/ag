@@ -21,6 +21,8 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
+mod git;
+
 #[derive(Clone)]
 struct Config {
     server: String,
@@ -34,6 +36,7 @@ struct Config {
     heartbeat_secs: u64,
     enroll_token: Option<String>,
     credential_path: PathBuf,
+    repository_root: PathBuf,
 }
 
 /// Node identity persisted to disk after enrollment (never re-sent in plaintext).
@@ -88,6 +91,10 @@ fn config_from_env() -> Config {
             .unwrap_or(10),
         enroll_token: std::env::var("AGENTGRID_ENROLL_TOKEN").ok(),
         credential_path: PathBuf::from(data_dir).join("credential.json"),
+        repository_root: PathBuf::from(
+            std::env::var("AGENTGRID_REPOSITORY_ROOT")
+                .unwrap_or_else(|_| "./agentgrid-repos".into()),
+        ),
     }
 }
 
@@ -179,13 +186,18 @@ async fn read_stream<R: AsyncRead + Unpin>(reader: R, sink: Arc<EventSink>, stre
 }
 
 async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignment) -> Result<()> {
-    let workdir = cfg.workspace_root.join(&assignment.attempt_id);
-    tokio::fs::create_dir_all(&workdir).await?;
-    tracing::info!(attempt_id = %assignment.attempt_id, "starting attempt");
+    let repo_root = cfg.repository_root.clone();
+    let ws_root = cfg.workspace_root.clone();
+    let prep_assignment = assignment.clone();
+    let ws = tokio::task::spawn_blocking(move || {
+        git::prepare_workspace(&repo_root, &ws_root, &prep_assignment)
+    })
+    .await??;
+    tracing::info!(attempt_id = %assignment.attempt_id, git = ws.is_git, "starting attempt");
 
     let mut cmd = tokio::process::Command::new(&cfg.adapter);
     cmd.arg("--prompt").arg(&assignment.prompt);
-    cmd.current_dir(&workdir);
+    cmd.current_dir(&ws.path);
     cmd.env("AGENTGRID_ATTEMPT_ID", &assignment.attempt_id);
     // Separate process group so a cancel can SIGTERM the whole tree (Stage 2.7).
     cmd.process_group(0);
@@ -196,7 +208,7 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         Ok(c) => c,
         Err(e) => {
             tracing::error!("failed to spawn adapter {}: {e}", cfg.adapter);
-            report_complete(&client, &cfg.server, &assignment.attempt_id, 127).await;
+            report_complete(&client, &cfg.server, &assignment.attempt_id, 127, None).await;
             return Ok(());
         }
     };
@@ -243,8 +255,19 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     sink.flush().await;
     flusher.abort();
 
+    let node_name = cfg.node_name.clone();
+    let commit_sha =
+        tokio::task::spawn_blocking(move || git::finalize_workspace(&ws, &node_name)).await??;
+
     tracing::info!(attempt_id = %assignment.attempt_id, exit_code = code, "attempt finished");
-    report_complete(&client, &cfg.server, &assignment.attempt_id, code).await;
+    report_complete(
+        &client,
+        &cfg.server,
+        &assignment.attempt_id,
+        code,
+        commit_sha,
+    )
+    .await;
     Ok(())
 }
 
@@ -283,9 +306,18 @@ fn terminate_group(pid: u32) {
     });
 }
 
-async fn report_complete(client: &reqwest::Client, server: &str, attempt_id: &str, exit_code: i32) {
+async fn report_complete(
+    client: &reqwest::Client,
+    server: &str,
+    attempt_id: &str,
+    exit_code: i32,
+    commit_sha: Option<String>,
+) {
     let url = format!("{}/v1/node/attempts/{}/complete", server, attempt_id);
-    let req = CompleteAttemptRequest { exit_code };
+    let req = CompleteAttemptRequest {
+        exit_code,
+        commit_sha,
+    };
     if let Err(e) = client.post(&url).json(&req).send().await {
         tracing::warn!("complete report failed for {attempt_id}: {e}");
     }
