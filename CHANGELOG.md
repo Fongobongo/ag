@@ -32,6 +32,11 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - End-to-end on one machine: `task run` → mock adapter writes file → `succeeded`, logs stream.
 - Control-plane restart on the same SQLite file preserves queued tasks (WAL).
 
+### Added (Stage 5.2 — metrics)
+- `GET /metrics` exposes Prometheus-text counts: `agentgrid_nodes{status}`,
+  `agentgrid_tasks{status}`, `agentgrid_attempts_total`.
+- Test: metrics endpoint returns counts.
+
 ### Added (Stage 3.3 / 3.4 — validation command + secret masking)
 - After the agent succeeds, the node runs `Assignment.validation_command` in the
   worktree (diff already committed first, so it survives a failure); non-zero exit

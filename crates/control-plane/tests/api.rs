@@ -514,3 +514,25 @@ async fn artifact_upload_and_read() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), b"diff --git a/x b/x".as_slice());
 }
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_counts() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("agentgrid_tasks"));
+    assert!(text.contains("agentgrid_attempts_total"));
+}

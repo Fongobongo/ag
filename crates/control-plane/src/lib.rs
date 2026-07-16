@@ -56,6 +56,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(show_task))
         .route("/v1/tasks/{id}/events", get(get_events))
@@ -128,6 +129,54 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+async fn metrics(State(state): State<Arc<AppState>>) -> (StatusCode, axum::response::Response) {
+    use axum::response::IntoResponse;
+    let nodes = match state.store.list_nodes().await {
+        Ok(n) => n,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "".into_response()),
+    };
+    let tasks = match state.store.list_tasks().await {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "".into_response()),
+    };
+    let attempts = state.store.count_attempts().await.unwrap_or(0);
+
+    let mut node_status = std::collections::HashMap::<String, u64>::new();
+    for n in &nodes {
+        *node_status.entry(format!("{}", n.status)).or_insert(0) += 1;
+    }
+    let mut task_status = std::collections::HashMap::<String, u64>::new();
+    for t in &tasks {
+        *task_status.entry(format!("{}", t.status)).or_insert(0) += 1;
+    }
+
+    let mut s = String::new();
+    s.push_str("# HELP agentgrid_nodes Nodes by status.\n");
+    s.push_str("# TYPE agentgrid_nodes gauge\n");
+    for (st, c) in &node_status {
+        s.push_str(&format!("agentgrid_nodes{{status=\"{st}\"}} {c}\n"));
+    }
+    s.push_str("# HELP agentgrid_tasks Tasks by status.\n");
+    s.push_str("# TYPE agentgrid_tasks gauge\n");
+    for (st, c) in &task_status {
+        s.push_str(&format!("agentgrid_tasks{{status=\"{st}\"}} {c}\n"));
+    }
+    s.push_str("# HELP agentgrid_attempts_total Total attempts.\n");
+    s.push_str("# TYPE agentgrid_attempts_total counter\n");
+    s.push_str(&format!("agentgrid_attempts_total {attempts}\n"));
+    (
+        StatusCode::OK,
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            s,
+        )
+            .into_response(),
+    )
 }
 
 async fn create_task(

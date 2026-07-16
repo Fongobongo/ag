@@ -467,6 +467,13 @@ impl Store {
         })
     }
 
+    pub async fn count_attempts(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM attempts")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>("c")?)
+    }
+
     pub async fn list_repositories(&self) -> Result<Vec<RepositoryView>> {
         let rows = sqlx::query(
             "SELECT id, name, git_url, default_branch, validation_command, created_at FROM repositories",
