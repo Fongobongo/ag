@@ -76,6 +76,20 @@ This is the Stage-1 vertical prototype. Persistence (SQLite WAL), auth, Git work
 - Schema migration `0004`: `repositories`, `node_repositories`.
 - Tests: repo create/list; node-daemon git worktree clone/commit/patch (real git).
 
+### Added (Stage 2.4 — scheduler filters + `no_eligible_nodes` visibility)
+- Scheduler filter centralised in `node_ineligibility` (shared by assignment and
+  visibility): only `online` nodes, with the task's adapter, the task's
+  repository (or wildcard `*`), and spare capacity (`active_attempts <
+  max_concurrency`).
+- `GET /v1/tasks/{id}/eligibility` returns per-node `NodeEligibility`
+  (`eligible` + `reasons`) and a `no_eligible_nodes` summary listing the
+  distinct reasons the task stays queued (empty when at least one node is
+  eligible). Honours `requested_node_id`: only that node is considered, and a
+  missing/offline requested node yields a clear reason.
+- CLI `task show` prints the `no_eligible_nodes` reasons for still-queued tasks.
+- Integration tests: empty pool, missing adapter, missing repository, at
+  capacity, and requested-node scoping.
+
 ### Added (Stage 2.3 — node lifecycle: enrollment, heartbeat, revoke)
 - Enrollment tokens: `POST /v1/nodes/enrollment-token` issues a one-time token
   (TTL 10 min; only its SHA-256 hash is stored).

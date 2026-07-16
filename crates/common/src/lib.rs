@@ -271,6 +271,25 @@ pub struct RepositoryView {
     pub created_at: String,
 }
 
+/// Per-node eligibility for a (repository, adapter) pair, with reasons when not
+/// eligible (Stage 2.4 `no_eligible_nodes` visibility).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeEligibility {
+    pub node_id: String,
+    pub status: NodeStatus,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Why a queued task has no eligible node, plus per-node detail (Stage 2.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEligibility {
+    pub task_id: String,
+    /// Distinct reasons no node can run the task; empty when at least one node is eligible.
+    pub no_eligible_nodes: Vec<String>,
+    pub nodes: Vec<NodeEligibility>,
+}
+
 /// Upload a text artifact (e.g. `changes.patch`) from a node to the control plane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UploadArtifactRequest {

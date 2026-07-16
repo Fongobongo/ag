@@ -12,7 +12,7 @@ use std::time::Instant;
 use agentgrid_common::{
     CancelState, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
     EnrollResponse, EnrollTokenResponse, EventsQuery, HeartbeatRequest, IngestEventsRequest,
-    PollRequest, PollResponse, RepositoryView, TaskView, UploadArtifactRequest,
+    PollRequest, PollResponse, RepositoryView, TaskEligibility, TaskView, UploadArtifactRequest,
 };
 use axum::{
     body::Body,
@@ -63,6 +63,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/tasks/{id}/events/stream", get(events_stream))
         .route("/v1/tasks/{id}/cancel", post(cancel_task_handler))
         .route("/v1/tasks/{id}/retry", post(retry_task_handler))
+        .route("/v1/tasks/{id}/eligibility", get(task_eligibility_handler))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
         .route("/v1/nodes/{id}", delete(revoke_node))
@@ -227,6 +228,22 @@ async fn show_task(
         .await
         .map_err(|e| {
             tracing::error!("show_task failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn task_eligibility_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskEligibility>, StatusCode> {
+    state
+        .store
+        .task_eligibility(&id)
+        .await
+        .map_err(|e| {
+            tracing::error!("task_eligibility failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .map(Json)

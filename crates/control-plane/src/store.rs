@@ -10,9 +10,9 @@ use std::time::Duration;
 use agentgrid_common::{
     next_attempt_status, next_task_status, Assignment, AttemptStatus, AttemptTransition,
     CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
-    EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest, NodeStatus, NodeView,
-    PollRequest, RepositoryView, TaskEvent, TaskStatus, TaskTransition, TaskView,
-    UploadArtifactRequest,
+    EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest, NodeEligibility,
+    NodeStatus, NodeView, PollRequest, RepositoryView, TaskEligibility, TaskEvent, TaskStatus,
+    TaskTransition, TaskView, UploadArtifactRequest,
 };
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
@@ -570,7 +570,8 @@ impl Store {
         };
 
         let node = sqlx::query(
-            "SELECT status, adapters, repositories, max_concurrency, active_attempts FROM nodes WHERE id = ?",
+            "SELECT id, name, status, adapters, repositories, max_concurrency, active_attempts, last_heartbeat_at, agent_version, load_avg, free_disk_mb \
+             FROM nodes WHERE id = ?",
         )
         .bind(node_id)
         .fetch_optional(&mut *tx)
@@ -579,26 +580,8 @@ impl Store {
             let _ = tx.rollback().await;
             return Ok(None);
         };
-        let node_status: String = node.try_get("status")?;
-        if node_status != "online" {
-            let _ = tx.rollback().await;
-            return Ok(None);
-        }
-        let node_adapters: String = node.try_get("adapters")?;
-        let node_repos: String = node.try_get("repositories")?;
-        let max_c: i64 = node.try_get("max_concurrency")?;
-        let active: i64 = node.try_get("active_attempts")?;
-        if active >= max_c {
-            let _ = tx.rollback().await;
-            return Ok(None);
-        }
-        let adapters: Vec<String> = serde_json::from_str(&node_adapters).unwrap_or_default();
-        let repos: Vec<String> = serde_json::from_str(&node_repos).unwrap_or_default();
-        if !adapters.contains(&adapter) {
-            let _ = tx.rollback().await;
-            return Ok(None);
-        }
-        if !repos.iter().any(|r| r == "*" || r == &repository) {
+        let nv = row_to_node_view(&node);
+        if !node_ineligibility(&nv, &repository, &adapter).is_empty() {
             let _ = tx.rollback().await;
             return Ok(None);
         }
@@ -662,6 +645,67 @@ impl Store {
             .fetch_one(&mut **tx)
             .await?;
         Ok(row.try_get::<i64, _>("c")?)
+    }
+
+    /// Stage 2.4: per-node eligibility for a task plus a `no_eligible_nodes`
+    /// summary (why it stays queued). Returns None if the task does not exist.
+    pub async fn task_eligibility(&self, task_id: &str) -> Result<Option<TaskEligibility>> {
+        let row = sqlx::query(
+            "SELECT repository, adapter, requested_node_id FROM tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let repository: String = row.try_get("repository")?;
+        let adapter: String = row.try_get("adapter")?;
+        let requested: Option<String> = row.try_get("requested_node_id")?;
+
+        let all = self.list_nodes().await?;
+        let considered: Vec<NodeView> = match &requested {
+            Some(id) => all.into_iter().filter(|n| &n.id == id).collect(),
+            None => all,
+        };
+
+        let mut nodes = Vec::new();
+        for n in &considered {
+            let reasons = node_ineligibility(n, &repository, &adapter);
+            nodes.push(NodeEligibility {
+                node_id: n.id.clone(),
+                status: n.status,
+                eligible: reasons.is_empty(),
+                reasons,
+            });
+        }
+
+        let no_eligible_nodes = if nodes.iter().any(|n| n.eligible) {
+            Vec::new()
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for n in &nodes {
+                for r in &n.reasons {
+                    if seen.insert(r.clone()) {
+                        out.push(r.clone());
+                    }
+                }
+            }
+            if out.is_empty() {
+                out.push(match &requested {
+                    Some(id) => format!("requested node {id} not registered"),
+                    None => "no nodes registered".to_string(),
+                });
+            }
+            out
+        };
+
+        Ok(Some(TaskEligibility {
+            task_id: task_id.to_string(),
+            no_eligible_nodes,
+            nodes,
+        }))
     }
 
     pub async fn ingest_events(&self, attempt_id: &str, req: &IngestEventsRequest) -> Result<bool> {
@@ -959,6 +1003,29 @@ fn row_to_task_view(r: &sqlx::sqlite::SqliteRow) -> TaskView {
         finished_at: r.try_get("finished_at").unwrap_or_default(),
         assigned_attempt_id: r.try_get("assigned_attempt_id").unwrap_or_default(),
     }
+}
+
+/// Stage 2.4 scheduler filter. Returns every reason `node` cannot run a task
+/// for `(repository, adapter)`; empty => eligible. Shared by [`Store::try_assign`]
+/// (per-node assignment) and [`Store::task_eligibility`] (visibility).
+fn node_ineligibility(node: &NodeView, repository: &str, adapter: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if node.status != NodeStatus::Online {
+        reasons.push(format!("node {} is {}", node.id, node.status));
+    }
+    if !node.adapters.iter().any(|a| a == adapter) {
+        reasons.push(format!("missing adapter {adapter}"));
+    }
+    if !node.repositories.iter().any(|r| r == "*" || r == repository) {
+        reasons.push(format!("missing repository {repository}"));
+    }
+    if node.active_attempts >= node.max_concurrency {
+        reasons.push(format!(
+            "at capacity ({} >= {})",
+            node.active_attempts, node.max_concurrency
+        ));
+    }
+    reasons
 }
 
 fn row_to_node_view(r: &sqlx::sqlite::SqliteRow) -> NodeView {

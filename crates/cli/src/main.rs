@@ -3,7 +3,7 @@
 //! Command grouping (`task run`, `node list`) is deferred; this flat form
 //! exercises the same `/v1` surface.
 
-use agentgrid_common::{CreateTaskRequest, TaskStatus, TaskView};
+use agentgrid_common::{CreateTaskRequest, TaskEligibility, TaskStatus, TaskView};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
@@ -170,6 +170,24 @@ async fn cmd_show(client: &reqwest::Client, base: &str, a: ShowArgs) -> Result<(
             .unwrap_or_else(|| "-".into())
     );
     println!("created:   {}", task.created_at);
+    if task.status == TaskStatus::Queued {
+        if let Ok(elig) = client
+            .get(format!("{base}/v1/tasks/{}/eligibility", task.id))
+            .send()
+            .await
+        {
+            if let Ok(elig) = elig.json::<TaskEligibility>().await {
+                if elig.no_eligible_nodes.is_empty() {
+                    println!("eligibility: waiting for an eligible node ({} online)", elig.nodes.len());
+                } else {
+                    println!("no eligible nodes:");
+                    for reason in &elig.no_eligible_nodes {
+                        println!("  - {reason}");
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

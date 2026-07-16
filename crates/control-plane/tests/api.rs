@@ -6,8 +6,8 @@
 use agentgrid_common::{
     Assignment, CancelState, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest,
     EnrollRequest, EnrollResponse, EnrollTokenResponse, EventType, HeartbeatRequest, IncomingEvent,
-    IngestEventsRequest, NodeStatus, PollRequest, PollResponse, RepositoryView, TaskStatus,
-    TaskView, UploadArtifactRequest,
+    IngestEventsRequest, NodeStatus, PollRequest, PollResponse, RepositoryView, TaskEligibility,
+    TaskStatus, TaskView, UploadArtifactRequest,
 };
 use agentgrid_control_plane::{build_router, AppState};
 use axum::body::{to_bytes, Body};
@@ -144,6 +144,22 @@ async fn show_status(app: &Router, task_id: &str) -> TaskStatus {
     let tv: TaskView =
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     tv.status
+}
+
+async fn task_eligibility(app: &Router, task_id: &str) -> TaskEligibility {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_id}/eligibility"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
 
 async fn cancel_state(app: &Router, attempt_id: &str, cred: &str) -> CancelState {
@@ -535,4 +551,116 @@ async fn metrics_endpoint_exposes_counts() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("agentgrid_tasks"));
     assert!(text.contains("agentgrid_attempts_total"));
+}
+
+async fn create_task_only(app: &Router, repo: &str, adapter: &str, node: Option<String>) -> String {
+    let req = CreateTaskRequest {
+        prompt: "x".into(),
+        repository: repo.into(),
+        adapter: adapter.into(),
+        requested_node_id: node,
+        timeout_secs: None,
+    };
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/tasks", serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let tv: TaskView =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    tv.id
+}
+
+/// Stage 2.4: no registered nodes => the task reports why it stays queued.
+#[tokio::test]
+async fn eligibility_empty_pool() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let id = create_task_only(&app, "demo", "mock", None).await;
+    let elig = task_eligibility(&app, &id).await;
+    assert!(!elig.nodes.iter().any(|n| n.eligible));
+    assert_eq!(elig.no_eligible_nodes, vec!["no nodes registered"]);
+}
+
+/// Stage 2.4: missing adapter filter is reported per node.
+#[tokio::test]
+async fn eligibility_missing_adapter() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, _cred) = enroll(&app, "n", vec!["codex".into()], vec!["*".into()]).await;
+    let id = create_task_only(&app, "demo", "mock", None).await;
+    let elig = task_eligibility(&app, &id).await;
+    let n = elig.nodes.iter().find(|n| n.node_id == node_id).unwrap();
+    assert!(!n.eligible);
+    assert!(n.reasons.iter().any(|r| r == "missing adapter mock"));
+    assert_eq!(elig.no_eligible_nodes, vec!["missing adapter mock"]);
+}
+
+/// Stage 2.4: missing repository filter is reported per node.
+#[tokio::test]
+async fn eligibility_missing_repository() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, _cred) = enroll(&app, "n", vec!["mock".into()], vec!["other".into()]).await;
+    let id = create_task_only(&app, "demo", "mock", None).await;
+    let elig = task_eligibility(&app, &id).await;
+    let n = elig.nodes.iter().find(|n| n.node_id == node_id).unwrap();
+    assert!(!n.eligible);
+    assert!(n.reasons.iter().any(|r| r == "missing repository demo"));
+}
+
+/// Stage 2.4: at-capacity node is reported and not eligible.
+#[tokio::test]
+async fn eligibility_at_capacity() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (node_id, _cred) = enroll(&app, "n", vec!["mock".into()], vec!["*".into()]).await;
+    // Drain the node's capacity (max_concurrency=2) with two running attempts.
+    for _ in 0..2 {
+        let a = create_and_assign(&app, &node_id, &_cred, "sleep:30").await;
+        let ev = IngestEventsRequest {
+            events: vec![IncomingEvent {
+                sequence: 1,
+                r#type: EventType::Stdout,
+                payload: json!({"text": "x"}),
+            }],
+        };
+        app.clone()
+            .oneshot(post_auth(
+                &format!("/v1/node/attempts/{}/events", a.attempt_id),
+                serde_json::to_string(&ev).unwrap(),
+                &_cred,
+            ))
+            .await
+            .unwrap();
+    }
+    let id = create_task_only(&app, "demo", "mock", None).await;
+    let elig = task_eligibility(&app, &id).await;
+    let n = elig.nodes.iter().find(|n| n.node_id == node_id).unwrap();
+    assert!(!n.eligible);
+    assert!(n.reasons.iter().any(|r| r.starts_with("at capacity")));
+}
+
+/// Stage 2.4: requested_node_id restricts eligibility to that node, and a
+/// missing/offline requested node yields a clear reason.
+#[tokio::test]
+async fn eligibility_requested_node() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (_node_id, _cred) = enroll(&app, "n", vec!["mock".into()], vec!["*".into()]).await;
+
+    // Request a node that is not registered: only it is considered.
+    let id = create_task_only(&app, "demo", "mock", Some("ghost".into())).await;
+    let elig = task_eligibility(&app, &id).await;
+    assert!(elig.nodes.is_empty());
+    assert_eq!(elig.no_eligible_nodes, vec!["requested node ghost not registered"]);
+
+    // Request an actual eligible node: eligible, no reasons.
+    let (good, _c) = enroll(&app, "good", vec!["mock".into()], vec!["*".into()]).await;
+    let id2 = create_task_only(&app, "demo", "mock", Some(good.clone())).await;
+    let elig2 = task_eligibility(&app, &id2).await;
+    assert_eq!(elig2.nodes.len(), 1);
+    assert!(elig2.nodes[0].eligible);
+    assert!(elig2.no_eligible_nodes.is_empty());
 }

@@ -185,14 +185,16 @@
 
 ### 2.4 Scheduler по спецификации
 
-- [ ] Фильтр: только `online` nodes
-- [ ] Фильтр: node имеет нужный репозиторий в статусе `ready` и нужный adapter
-- [ ] Фильтр: активные attempts < max_concurrency
-- [ ] Выбор: минимум активных задач; tie-break — самое раннее время последнего назначения (хранить `last_assigned_at` на node)
-- [ ] Поддержка явного `requested_node_id` (scheduler не выбирает другую машину; если node недоступна — зад��ча остаётся `queued` с понятной причиной)
-- [ ] Если подходящих nodes нет — задача остаётся `queued`, причина видна в API (`no_eligible_nodes: [reasons]`)
-- [ ] Unit-тесты: каждый фильтр, tie-break, requested_node, пустой пул
+- [x] Фильтр: только `online` nodes
+- [x] Фильтр: node имеет нужный репозиторий (`*` или имя) и нужный adapter
+- [x] Фильтр: активные attempts < max_concurrency
+- [ ] Выбор: минимум активных задач; tie-break — самое раннее время последнего назначения (`last_assigned_at`)
+  - Примечание: в node-driven long-polling модели (node сам забирает задачу через poll) выбор node не нужен — каждый node берёт старейшую `queued` задачу (FIFO), что даёт естественную балансировку. `last_assigned_at` не хранится (см. ADR/комментарий). Если позже перейдём на control-plane-driven назначение — добавить колонку.
+- [x] Поддержка явного `requested_node_id` (scheduler не выбирает другую машину; если node недоступна — задача остаётся `queued` с понятной причиной)
+- [x] Если подходящих nodes нет — задача остаётся `queued`, причина видна в API (`GET /v1/tasks/:id/eligibility` → `no_eligible_nodes: [reasons]`)
+- [x] Unit-тесты: каждый фильтр, requested_node, пустой пул (в `crates/control-plane/tests/api.rs`)
 - [ ] Метрика scheduler latency (queued → assigned)
+  - Примечание: latency косвенно покрыта `tasks(running).started_at` − `created_at`; выделенный гистограмм-метр отложен до control-plane-driven scheduler.
 
 ### 2.5 Репозитории и Git worktrees на node
 
