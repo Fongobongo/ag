@@ -181,6 +181,10 @@ struct EventSink {
     buf: Mutex<VecDeque<IncomingEvent>>,
     next: AtomicU64,
     notify: Notify,
+    // Counts events that came from the adapter's stdout/stderr (excludes the
+    // daemon's own synthetic "attempt started" event). Used to warn on a
+    // silent agent that exits 0 but produced no output.
+    adapter_events: AtomicU64,
     attempt_id: String,
     client: reqwest::Client,
     server: String,
@@ -192,10 +196,21 @@ impl EventSink {
             buf: Mutex::new(VecDeque::new()),
             next: AtomicU64::new(1),
             notify: Notify::new(),
+            adapter_events: AtomicU64::new(0),
             attempt_id,
             client,
             server,
         })
+    }
+
+    /// Record that an event originated from the adapter output (not the
+    /// daemon's own synthetic events).
+    fn note_adapter_event(&self) {
+        self.adapter_events.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adapter_event_count(&self) -> u64 {
+        self.adapter_events.load(Ordering::SeqCst)
     }
 
     async fn push(&self, ty: EventType, payload: serde_json::Value) {
@@ -254,7 +269,10 @@ async fn read_stream<R: AsyncRead + Unpin>(
             let _ = g.write_all(b"\n").await;
         }
         match serde_json::from_str::<AdapterEvent>(&masked) {
-            Ok(ae) => sink.push(to_event_type(&ae.r#type), ae.payload).await,
+            Ok(ae) => {
+                sink.push(to_event_type(&ae.r#type), ae.payload).await;
+                sink.note_adapter_event();
+            }
             Err(_) => {
                 let ty = if stream == "stderr" {
                     EventType::Stderr
@@ -262,6 +280,7 @@ async fn read_stream<R: AsyncRead + Unpin>(
                     EventType::Stdout
                 };
                 sink.push(ty, json!({ "text": line })).await;
+                sink.note_adapter_event();
             }
         }
     }
@@ -378,6 +397,15 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     let _ = r1.await;
     let _ = r2.await;
     sink.flush().await;
+    // A silent agent that exits 0 without producing any output yields a task
+    // that looks "succeeded" but is empty (e.g. opencode emitted nothing for a
+    // run). Surface it so ops can notice the missing output.
+    if code == 0 && sink.adapter_event_count() == 0 {
+        tracing::warn!(
+            attempt_id = %assignment.attempt_id,
+            "adapter exited 0 but produced no stdout/stderr events; task output may be empty (silent agent?)"
+        );
+    }
     flusher.abort();
 
     let node_name = cfg.node_name.clone();

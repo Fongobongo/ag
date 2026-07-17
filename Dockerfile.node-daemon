@@ -8,7 +8,7 @@ RUN cargo build --release --bins -p agentgrid-node-daemon -p agentgrid-adapters
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git bash \
+    && apt-get install -y --no-install-recommends ca-certificates git bash curl \
     && rm -rf /var/lib/apt/lists/*
 # The agentgrid user runs the daemon (root refused unless AGENTGRID_ALLOW_ROOT=1).
 RUN useradd -r -m -d /var/lib/agentgrid agentgrid \
@@ -24,5 +24,18 @@ ENV AGENTGRID_DATA_DIR=/var/lib/agentgrid/data \
     AGENTGRID_REPOSITORY_ROOT=/var/lib/agentgrid/repos \
     AGENTGRID_ADAPTER=adapter-mock \
     AGENTGRID_ADAPTERS=mock
+# Optional: bake the opencode CLI into the image for a self-contained opencode
+# node. Leave OPENCODE_VERSION empty to preserve the operator-provided contract
+# (AGENTS.md: no required runtime deps). Usage:
+#   docker build --build-arg OPENCODE_VERSION=1.17.16 -f Dockerfile.node-daemon -t ag-node-opencode .
+ARG OPENCODE_VERSION=""
+RUN if [ -n "$OPENCODE_VERSION" ]; then \
+      curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/opencode.tar.gz \
+      && mkdir -p /tmp/oc \
+      && tar -xzf /tmp/opencode.tar.gz -C /tmp/oc \
+      && find /tmp/oc -name opencode -type f -exec mv {} /usr/local/bin/opencode \; \
+      && chmod +x /usr/local/bin/opencode \
+      && rm -rf /tmp/oc /tmp/opencode.tar.gz; \
+    fi
 USER agentgrid
 ENTRYPOINT ["agentgrid-node-daemon"]
