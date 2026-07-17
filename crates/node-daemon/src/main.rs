@@ -334,6 +334,13 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         client.clone(),
         cfg.server.clone(),
     );
+    // Confirm liveness at once so the assignment lease (store.rs ASSIGNMENT_LEASE_SECS)
+    // cannot expire before a slow agent emits its first event. Without this a silent
+    // agent that starts but takes >lease seconds to produce output loses the
+    // assignment and the task is reassigned (double-attempt). The first ingested
+    // event flips the attempt to 'running', after which the lease revert is a no-op.
+    sink.push(EventType::Metric, json!({ "text": "attempt started" }))
+        .await;
     let flusher = tokio::spawn(sink.clone().run_flusher());
 
     let r1 = tokio::spawn(read_stream(
