@@ -12,6 +12,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("agentgrid-control-plane {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let addr: SocketAddr = std::env::var("AGENTGRID_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:7800".into())
         .parse()?;

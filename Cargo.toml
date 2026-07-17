@@ -37,3 +37,11 @@ jsonwebtoken = "9"
 rand = "0.8"
 agentgrid-common = { path = "crates/common" }
 agentgrid-adapters = { path = "crates/adapters" }
+
+# Stage 6.2: release profile tuned for small static binaries.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
