@@ -92,6 +92,97 @@ display_snake!(AttemptStatus);
 display_snake!(NodeStatus);
 display_snake!(EventType);
 
+/// Richer adapter event vocabulary introduced in Stage 3.1. Any unrecognized
+/// `kind` string is preserved as `Other(String)` so a future adapter cannot
+/// break the pipeline (unknown events become raw logs, never a fatal error).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventKind {
+    Plan,
+    ToolCall,
+    ToolResult,
+    FileChange,
+    PermissionRequest,
+    Usage,
+    Handoff,
+    Status,
+    Log,
+    Progress,
+    Result,
+    Error,
+    Other(String),
+}
+
+impl Serialize for EventKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let v = match self {
+            EventKind::Plan => "plan",
+            EventKind::ToolCall => "tool_call",
+            EventKind::ToolResult => "tool_result",
+            EventKind::FileChange => "file_change",
+            EventKind::PermissionRequest => "permission_request",
+            EventKind::Usage => "usage",
+            EventKind::Handoff => "handoff",
+            EventKind::Status => "status",
+            EventKind::Log => "log",
+            EventKind::Progress => "progress",
+            EventKind::Result => "result",
+            EventKind::Error => "error",
+            EventKind::Other(o) => o.as_str(),
+        };
+        s.serialize_str(v)
+    }
+}
+
+impl<'de> Deserialize<'de> for EventKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "plan" => EventKind::Plan,
+            "tool_call" => EventKind::ToolCall,
+            "tool_result" => EventKind::ToolResult,
+            "file_change" => EventKind::FileChange,
+            "permission_request" => EventKind::PermissionRequest,
+            "usage" => EventKind::Usage,
+            "handoff" => EventKind::Handoff,
+            "status" => EventKind::Status,
+            "log" => EventKind::Log,
+            "progress" => EventKind::Progress,
+            "result" => EventKind::Result,
+            "error" => EventKind::Error,
+            other => EventKind::Other(other.to_string()),
+        })
+    }
+}
+
+impl EventKind {
+    /// Map a 3.1 event kind onto the legacy stored [`EventType`] so the
+    /// existing storage/query contract is unchanged.
+    pub fn to_event_type(&self) -> EventType {
+        match self {
+            EventKind::Plan | EventKind::Handoff | EventKind::Status => EventType::Status,
+            EventKind::ToolCall | EventKind::ToolResult => EventType::Tool,
+            EventKind::FileChange => EventType::Artifact,
+            EventKind::PermissionRequest | EventKind::Log => EventType::Stdout,
+            EventKind::Usage | EventKind::Progress => EventType::Metric,
+            EventKind::Result => EventType::Result,
+            EventKind::Error => EventType::Error,
+            EventKind::Other(_) => EventType::Stdout,
+        }
+    }
+}
+
+/// Versioned adapter event envelope (Stage 3.1), layered over the stored
+/// `TaskEvent`. `raw_ref` optionally points at a content-addressed raw blob
+/// when the payload is too large to inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEventEnvelope {
+    pub version: u8,
+    pub kind: EventKind,
+    pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_ref: Option<String>,
+}
+
 // ----- API DTOs -----
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,6 +453,49 @@ mod tests {
         assert_eq!(round_trip(&e), e);
         let e = EventType::Result;
         assert_eq!(round_trip(&e), e);
+    }
+
+    #[test]
+    fn event_kind_round_trips_known_and_preserves_unknown() {
+        for (kind, wire) in [
+            (EventKind::Plan, "plan"),
+            (EventKind::ToolCall, "tool_call"),
+            (EventKind::ToolResult, "tool_result"),
+            (EventKind::FileChange, "file_change"),
+            (EventKind::PermissionRequest, "permission_request"),
+            (EventKind::Usage, "usage"),
+            (EventKind::Handoff, "handoff"),
+            (EventKind::Status, "status"),
+            (EventKind::Log, "log"),
+            (EventKind::Progress, "progress"),
+            (EventKind::Result, "result"),
+            (EventKind::Error, "error"),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{wire}\""));
+            assert_eq!(round_trip(&kind), kind);
+        }
+        // Unknown kinds are preserved verbatim, never an error.
+        let unknown: EventKind = serde_json::from_str("\"future_event\"").unwrap();
+        assert_eq!(unknown, EventKind::Other("future_event".into()));
+        assert_eq!(serde_json::to_string(&unknown).unwrap(), "\"future_event\"");
+        assert_eq!(round_trip(&unknown), unknown);
+    }
+
+    #[test]
+    fn envelope_round_trip_and_maps_to_legacy_type() {
+        let env = AgentEventEnvelope {
+            version: 1,
+            kind: EventKind::ToolCall,
+            payload: serde_json::json!({ "name": "edit" }),
+            raw_ref: None,
+        };
+        assert_eq!(round_trip(&env), env);
+        assert_eq!(env.kind.to_event_type(), EventType::Tool);
+        // Unknown kind inside an envelope still decodes and maps to a raw log.
+        let unknown: AgentEventEnvelope =
+            serde_json::from_str(r#"{"version":1,"kind":"weird","payload":{}}"#).unwrap();
+        assert_eq!(unknown.kind, EventKind::Other("weird".into()));
+        assert_eq!(unknown.kind.to_event_type(), EventType::Stdout);
     }
 
     #[test]

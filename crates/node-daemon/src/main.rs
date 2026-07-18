@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use agentgrid_adapters::{to_event_type, AdapterEvent};
 use agentgrid_common::{
-    Assignment, CancelState, CompleteAttemptRequest, EnrollRequest, EnrollResponse, EventType,
-    HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus, PollRequest, PollResponse,
-    UploadArtifactRequest,
+    AgentEventEnvelope, Assignment, CancelState, CompleteAttemptRequest, EnrollRequest,
+    EnrollResponse, EventType, HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus,
+    PollRequest, PollResponse, UploadArtifactRequest,
 };
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -307,6 +307,14 @@ async fn read_stream<R: AsyncRead + Unpin>(
             let mut g = f.lock().await;
             let _ = g.write_all(masked.as_bytes()).await;
             let _ = g.write_all(b"\n").await;
+        }
+        // Stage 3.1: accept the versioned envelope first; fall back to the
+        // legacy `{type, payload}` adapter event; anything else is a raw log.
+        // Unknown kinds are preserved (never fatal).
+        if let Ok(env) = serde_json::from_str::<AgentEventEnvelope>(&masked) {
+            sink.push(env.kind.to_event_type(), env.payload).await;
+            sink.note_adapter_event();
+            continue;
         }
         match serde_json::from_str::<AdapterEvent>(&masked) {
             Ok(ae) => {
