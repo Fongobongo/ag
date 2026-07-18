@@ -4,6 +4,11 @@
 //! `repository_root/<name>`; each attempt gets a dedicated worktree on a
 //! branch `agent/<task-id>/<n>`. Plain-dir tasks (empty `git_url`) just get a
 //! fresh directory and no commit.
+//!
+//! Every git invocation passes one argument per token through `Command::arg`
+//! (no `sh -c`), so a crafted `git_url`/`repository`/`branch` from the control
+//! plane cannot inject a shell command. Tokens are validated as defense-in-depth
+//! (Stage 2.3).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,30 +27,54 @@ pub struct Workspace {
     pub is_git: bool,
 }
 
-fn sh(dir: Option<&Path>, cmd: &str) -> Result<()> {
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(dir.unwrap_or_else(|| Path::new(".")))
+/// Run `git` with explicit args (no shell). Args are passed verbatim, so they
+/// cannot be reinterpreted as shell syntax.
+fn git(dir: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
         .status()
-        .context("failed to spawn sh")?;
+        .context("failed to spawn git")?;
     if !status.success() {
-        anyhow::bail!("command failed: {cmd}");
+        anyhow::bail!("git {:?} failed", args);
     }
     Ok(())
 }
 
-fn output(dir: &Path, cmd: &str) -> Result<String> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+/// Like [`git`] but capture stdout (trimmed).
+fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .args(args)
         .current_dir(dir)
         .output()
-        .context("failed to spawn sh")?;
+        .context("failed to spawn git")?;
     if !out.status.success() {
-        anyhow::bail!("command failed: {cmd}");
+        anyhow::bail!("git {:?} failed", args);
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Reject git ref / slug tokens that could enable traversal or shell injection.
+/// Git is invoked without a shell, so this is defense-in-depth against malformed
+/// control-plane input (Stage 2.3).
+fn validate_token(s: &str) -> Result<()> {
+    if s.is_empty()
+        || s.chars().any(|c| "\"';|&$()`><\\\n\t{}".contains(c))
+        || s.contains("..")
+        || s.starts_with('/')
+    {
+        anyhow::bail!("unsafe git token: {s:?}");
+    }
+    Ok(())
+}
+
+/// Reject a git URL that embeds shell metacharacters (defense-in-depth; the URL
+/// is passed as a single git argument, not through a shell).
+fn validate_git_url(s: &str) -> Result<()> {
+    if s.chars().any(|c| "\"';|&$()`><\\\n\t".contains(c)) {
+        anyhow::bail!("unsafe git url: {s:?}");
+    }
+    Ok(())
 }
 
 /// Ensure the repo clone exists and create a per-attempt worktree.
@@ -65,35 +94,33 @@ pub fn prepare_workspace(
             is_git: false,
         });
     }
+    validate_token(&assignment.repository)?;
+    validate_token(&assignment.task_id)?;
+    validate_token(&assignment.default_branch)?;
+    validate_git_url(&assignment.git_url)?;
+
     let repo_dir = repository_root.join(&assignment.repository);
     let branch = format!("agent/{}/{}", assignment.task_id, assignment.number);
+    let db = assignment.default_branch.as_str();
+    let gurl = assignment.git_url.as_str();
+    let repo = assignment.repository.as_str();
     if repo_dir.join(".git").exists() {
-        sh(
-            Some(&repo_dir),
-            &format!("git fetch origin {}", assignment.default_branch),
-        )?;
+        git(&repo_dir, &["fetch", "origin", db])?;
     } else {
         std::fs::create_dir_all(repository_root)?;
-        sh(
-            Some(repository_root),
-            &format!("git clone {} {}", assignment.git_url, assignment.repository),
-        )?;
+        git(repository_root, &["clone", gurl, repo])?;
     }
-    sh(
-        Some(&repo_dir),
-        &format!(
-            "git checkout -B {} origin/{}",
-            assignment.default_branch, assignment.default_branch
-        ),
-    )?;
-    sh(
-        Some(&repo_dir),
-        &format!(
-            "git worktree add {} -b {} {}",
-            ws.display(),
-            branch,
-            assignment.default_branch
-        ),
+    git(&repo_dir, &["checkout", "-B", db, &format!("origin/{db}")])?;
+    git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            ws.to_str().unwrap_or(""),
+            "-b",
+            &branch,
+            db,
+        ],
     )?;
     Ok(Workspace {
         path: ws,
@@ -112,29 +139,30 @@ pub fn finalize_workspace(ws: Workspace, committer_email: &str) -> Result<Option
         (Some(r), Some(b)) => (r, b),
         _ => return Ok(None),
     };
-    sh(Some(&ws.path), "git add -A")?;
-    let has_changes = !Command::new("sh")
-        .arg("-c")
-        .arg("git diff --cached --quiet")
+    git(&ws.path, &["add", "-A"])?;
+    let has_changes = !Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
         .current_dir(&ws.path)
         .status()?
         .success();
     let sha = if has_changes {
-        sh(
-            Some(&ws.path),
-            &format!(
-                "git -c user.name=agentgrid -c user.email={email} commit -m 'agentgrid: {branch}'",
-                email = committer_email
-            ),
+        git(
+            &ws.path,
+            &[
+                "-c",
+                "user.name=agentgrid",
+                "-c",
+                &format!("user.email={committer_email}"),
+                "commit",
+                "-m",
+                &format!("agentgrid: {branch}"),
+            ],
         )?;
-        output(&ws.path, "git rev-parse HEAD")?
+        git_out(&ws.path, &["rev-parse", "HEAD"])?
     } else {
-        output(&ws.path, "git rev-parse HEAD")?
+        git_out(&ws.path, &["rev-parse", "HEAD"])?
     };
-    let patch = output(
-        repo_dir,
-        &format!("git diff {} {} --binary", ws.default_branch, branch),
-    )?;
+    let patch = git_out(repo_dir, &["diff", &ws.default_branch, branch, "--binary"])?;
     std::fs::write(ws.path.join("changes.patch"), patch)?;
     Ok(Some(sha))
 }
@@ -176,12 +204,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ag-git-{}", uuid::Uuid::new_v4()));
         let origin = dir.join("origin");
         std::fs::create_dir_all(&origin).unwrap();
-        sh(Some(&origin), "git init -q -b main").unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]).unwrap();
         std::fs::write(origin.join("base.txt"), "base").unwrap();
-        sh(Some(&origin), "git add -A").unwrap();
-        sh(
-            Some(&origin),
-            "git -c user.name=t -c user.email=t@x commit -q -m init",
+        git(&origin, &["add", "-A"]).unwrap();
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
         )
         .unwrap();
 
@@ -196,6 +233,38 @@ mod tests {
         assert!(sha.is_some());
         let patch = std::fs::read_to_string(&patch_path).unwrap();
         assert!(patch.contains("new.txt"), "patch missing new file: {patch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_injection_in_repo_branch_or_url() {
+        let dir = std::env::temp_dir().join(format!("ag-git-inj-{}", uuid::Uuid::new_v4()));
+        let repos = dir.join("repos");
+        let ws = dir.join("ws");
+        let mut a = make_assignment("https://example.com/repo", "main");
+
+        a.repository = "repo; rm -rf /".into();
+        assert!(
+            prepare_workspace(&repos, &ws, &a).is_err(),
+            "repo injection"
+        );
+
+        a.repository = "repo".into();
+        a.default_branch = "main; touch /tmp/pwn".into();
+        assert!(
+            prepare_workspace(&repos, &ws, &a).is_err(),
+            "branch injection"
+        );
+
+        a.default_branch = "../escape".into();
+        assert!(
+            prepare_workspace(&repos, &ws, &a).is_err(),
+            "branch traversal"
+        );
+
+        a.default_branch = "main".into();
+        a.git_url = "$(curl evil)".into();
+        assert!(prepare_workspace(&repos, &ws, &a).is_err(), "url injection");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

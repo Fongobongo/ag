@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +31,6 @@ struct Config {
     node_name: String,
     workspace_root: PathBuf,
     max_concurrency: u32,
-    adapter: String,
     agent_version: String,
     adapters: Vec<String>,
     repositories: Vec<String>,
@@ -86,7 +85,6 @@ fn config_from_env() -> Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2),
-        adapter: std::env::var("AGENTGRID_ADAPTER").unwrap_or_else(|_| "adapter-mock".into()),
         agent_version: std::env::var("AGENTGRID_AGENT_VERSION")
             .unwrap_or_else(|_| "0.1.0-dev".into()),
         adapters: split_csv("AGENTGRID_ADAPTERS", "mock"),
@@ -139,20 +137,42 @@ struct AdapterProbe {
     version: Option<String>,
 }
 
-async fn probe_adapter(bin: &str) -> AdapterProbe {
-    let which = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v '{bin}'"))
-        .output()
-        .await;
-    let found = match which {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            o.status.success() && !out.trim().is_empty()
+/// Resolve `bin` to an executable file on `PATH` (or a literal path if it
+/// contains `/`). No shell is involved, so a crafted adapter id cannot inject
+/// commands (Stage 2.3). Adapter ids come from operator config, not tasks.
+fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {
+    if bin.contains('/') {
+        return if std::path::Path::new(bin).is_file() {
+            Some(std::path::PathBuf::from(bin))
+        } else {
+            None
+        };
+    }
+    let path = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(bin);
+        if p.is_file() {
+            return Some(p);
         }
-        Err(_) => false,
-    };
-    if !found {
+    }
+    None
+}
+
+/// Map an adapter id (e.g. `mock`, `claude`) to its binary name (`adapter-mock`).
+fn adapter_bin_name(adapter_id: &str) -> String {
+    format!("adapter-{}", adapter_id.replace('_', "-"))
+}
+
+/// Resolve the adapter binary for `adapter_id` on PATH. Returns None when the
+/// node cannot run that adapter, so the attempt can be failed as
+/// `infrastructure_failed` (Stage 2.4).
+fn resolve_adapter_bin(adapter_id: &str) -> Option<String> {
+    let bin = adapter_bin_name(adapter_id);
+    resolve_in_path(&bin).map(|_| bin)
+}
+
+async fn probe_adapter(bin: &str) -> AdapterProbe {
+    if resolve_in_path(bin).is_none() {
         return AdapterProbe {
             found: false,
             version: None,
@@ -328,7 +348,30 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         .ok()
         .map(|f| Arc::new(Mutex::new(f)));
 
-    let mut cmd = tokio::process::Command::new(&cfg.adapter);
+    // Stage 2.4: run strictly the adapter the control plane assigned; an
+    // unknown or missing adapter binary is an infrastructure failure, not a
+    // silent fallback to whatever binary happens to be configured.
+    let bin = match resolve_adapter_bin(&assignment.adapter) {
+        Some(b) => b,
+        None => {
+            tracing::error!(
+                attempt_id = %assignment.attempt_id,
+                adapter = %assignment.adapter,
+                "adapter binary not found; reporting infrastructure_failed"
+            );
+            report_complete(
+                &client,
+                &cfg.server,
+                &assignment.attempt_id,
+                127,
+                None,
+                Some("infrastructure_failed".into()),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("--prompt").arg(&assignment.prompt);
     cmd.current_dir(&ws.path);
     cmd.env("AGENTGRID_ATTEMPT_ID", &assignment.attempt_id);
@@ -344,7 +387,7 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("failed to spawn adapter {}: {e}", cfg.adapter);
+            tracing::error!("failed to spawn adapter {}: {e}", bin);
             report_complete(
                 &client,
                 &cfg.server,
@@ -754,21 +797,27 @@ async fn poll_loop(cfg: Config, cred: SavedCredential) -> Result<()> {
         .build()?;
     let sem = Arc::new(Semaphore::new(cfg.max_concurrency as usize));
 
-    // Capability discovery: re-probe the adapter each heartbeat (Stage 3.1).
-    // A missing binary => degraded, so the scheduler excludes this node.
-    let adapter_ok = Arc::new(AtomicBool::new(true));
-
     // Heartbeat loop: publish status/load/capabilities periodically.
     let hb_sem = sem.clone();
     let hb_cfg = cfg.clone();
     let hb_client = client.clone();
     let hb_node_id = cred.node_id.clone();
-    let hb_adapter_ok = adapter_ok.clone();
     tokio::spawn(async move {
         loop {
-            let probe = probe_adapter(&hb_cfg.adapter).await;
-            hb_adapter_ok.store(probe.found, Ordering::Relaxed);
-            let status = if probe.found {
+            // Stage 2.4: only advertise as Online when every configured adapter
+            // binary is present; a missing one degrades the node.
+            let all_ok = {
+                let mut ok = true;
+                for a in &hb_cfg.adapters {
+                    let bin = format!("adapter-{}", a.replace('_', "-"));
+                    if !probe_adapter(&bin).await.found {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            };
+            let status = if all_ok {
                 NodeStatus::Online
             } else {
                 NodeStatus::Degraded
@@ -867,21 +916,24 @@ async fn main() -> Result<()> {
     }
 
     let cfg = config_from_env();
-    let probe = probe_adapter(&cfg.adapter).await;
-    if probe.found {
-        tracing::info!(adapter = %cfg.adapter, version = ?probe.version, "adapter detected");
-    } else {
-        tracing::warn!(
-            adapter = %cfg.adapter,
-            "adapter binary not found in PATH; node will report degraded until it is installed"
-        );
+    for a in &cfg.adapters {
+        let bin = format!("adapter-{}", a.replace('_', "-"));
+        let probe = probe_adapter(&bin).await;
+        if probe.found {
+            tracing::info!(adapter = %a, version = ?probe.version, "adapter detected");
+        } else {
+            tracing::warn!(
+                adapter = %a,
+                "adapter binary {bin} not found in PATH; node will report degraded until installed"
+            );
+        }
     }
     tokio::fs::create_dir_all(&cfg.workspace_root).await?;
     let cred = load_or_enroll(&cfg).await?;
     tracing::info!(
         node_id = %cred.node_id,
         server = %cfg.server,
-        adapter = %cfg.adapter,
+        adapters = ?cfg.adapters,
         "node daemon starting"
     );
     poll_loop(cfg, cred).await
@@ -958,6 +1010,18 @@ mod tests {
         );
         // No secrets configured -> unchanged.
         assert_eq!(mask_secrets("nothing", &vec![]), "nothing");
+    }
+
+    #[test]
+    fn adapter_bin_name_maps_id() {
+        assert_eq!(adapter_bin_name("mock"), "adapter-mock");
+        assert_eq!(adapter_bin_name("claude"), "adapter-claude");
+        assert_eq!(adapter_bin_name("my_adapter"), "adapter-my-adapter");
+    }
+
+    #[test]
+    fn resolve_adapter_bin_rejects_missing() {
+        assert!(resolve_adapter_bin("definitely-not-an-adapter-xyz").is_none());
     }
 
     #[test]

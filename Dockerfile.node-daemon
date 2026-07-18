@@ -22,7 +22,6 @@ COPY --from=builder /src/target/release/adapter-opencode /usr/local/bin/
 ENV AGENTGRID_DATA_DIR=/var/lib/agentgrid/data \
     AGENTGRID_WORKSPACE_ROOT=/var/lib/agentgrid/workspace \
     AGENTGRID_REPOSITORY_ROOT=/var/lib/agentgrid/repos \
-    AGENTGRID_ADAPTER=adapter-mock \
     AGENTGRID_ADAPTERS=mock
 # Optional: bake the opencode CLI into the image for a self-contained opencode
 # node. Leave OPENCODE_VERSION empty to preserve the operator-provided contract
