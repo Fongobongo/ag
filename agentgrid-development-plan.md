@@ -141,7 +141,7 @@
 - [x] Добавить `AgentSession` (таблица + DTO), связанную с existing Attempt (`agent_session_id` nullable)
 - [x] `AgentCapabilities` с версиями/readiness поверх heartbeat JSON
 - [ ] Conformance suite: fixtures для mock/claude/opencode (prepare/start/stream/cancel/collect)
-- [ ] Cancellation semantics в normalized events (`cancel_requested` → `cancelled` без гонок)
+- [x] Cancellation semantics в normalized events (`cancel_requested` → `cancelled` без гонок): `EventKind::Cancel` + node emits it on cancel
 - [ ] Миграции schema без изменения legacy happy path (E2E старого сценария зелёный до и после)
 
 **Exit 3:** три существующих adapter проходят conformance suite; legacy CLI/Web сценарий не изменился.

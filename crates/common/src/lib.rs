@@ -104,6 +104,7 @@ pub enum EventKind {
     PermissionRequest,
     Usage,
     Handoff,
+    Cancel,
     Status,
     Log,
     Progress,
@@ -122,6 +123,7 @@ impl Serialize for EventKind {
             EventKind::PermissionRequest => "permission_request",
             EventKind::Usage => "usage",
             EventKind::Handoff => "handoff",
+            EventKind::Cancel => "cancel",
             EventKind::Status => "status",
             EventKind::Log => "log",
             EventKind::Progress => "progress",
@@ -144,6 +146,7 @@ impl<'de> Deserialize<'de> for EventKind {
             "permission_request" => EventKind::PermissionRequest,
             "usage" => EventKind::Usage,
             "handoff" => EventKind::Handoff,
+            "cancel" => EventKind::Cancel,
             "status" => EventKind::Status,
             "log" => EventKind::Log,
             "progress" => EventKind::Progress,
@@ -159,7 +162,9 @@ impl EventKind {
     /// existing storage/query contract is unchanged.
     pub fn to_event_type(&self) -> EventType {
         match self {
-            EventKind::Plan | EventKind::Handoff | EventKind::Status => EventType::Status,
+            EventKind::Plan | EventKind::Handoff | EventKind::Status | EventKind::Cancel => {
+                EventType::Status
+            }
             EventKind::ToolCall | EventKind::ToolResult => EventType::Tool,
             EventKind::FileChange => EventType::Artifact,
             EventKind::PermissionRequest | EventKind::Log => EventType::Stdout,
@@ -495,6 +500,7 @@ mod tests {
             (EventKind::PermissionRequest, "permission_request"),
             (EventKind::Usage, "usage"),
             (EventKind::Handoff, "handoff"),
+            (EventKind::Cancel, "cancel"),
             (EventKind::Status, "status"),
             (EventKind::Log, "log"),
             (EventKind::Progress, "progress"),

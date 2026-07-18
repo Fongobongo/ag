@@ -12,8 +12,8 @@ use std::time::Duration;
 use agentgrid_adapters::{to_event_type, AdapterEvent, ExecutionBackend};
 use agentgrid_common::{
     AdapterCapability, AgentEventEnvelope, Assignment, CancelState, CompleteAttemptRequest,
-    CreateAgentSessionRequest, EnrollRequest, EnrollResponse, EventType, HeartbeatRequest,
-    IncomingEvent, IngestEventsRequest, NodeStatus, PollRequest, PollResponse,
+    CreateAgentSessionRequest, EnrollRequest, EnrollResponse, EventKind, EventType,
+    HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus, PollRequest, PollResponse,
     UploadArtifactRequest,
 };
 use anyhow::Result;
@@ -471,6 +471,17 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
             (status.code().unwrap_or(-1), Some("timeout"))
         }
         Outcome::Cancel => {
+            // Stage 3.2: record cancellation in the normalized event stream
+            // before tearing down the process group.
+            sink.push(
+                EventKind::Cancel.to_event_type(),
+                json!({
+                    "kind": "cancel",
+                    "reason": "user_requested",
+                    "attempt_id": assignment.attempt_id
+                }),
+            )
+            .await;
             terminate_group(pid);
             let status = child.wait().await?;
             (status.code().unwrap_or(-1), None)
