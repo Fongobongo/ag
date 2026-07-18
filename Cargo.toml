@@ -6,6 +6,7 @@ members = [
     "crates/node-daemon",
     "crates/cli",
     "crates/adapters",
+    "crates/skills",
 ]
 
 [workspace.package]

@@ -152,12 +152,12 @@
 
 ### 4.1 Формат и discovery
 
-- [ ] Парсер `SKILL.md` (YAML frontmatter: `name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools`)
-- [ ] Strict validation + lenient diagnostics режимы
-- [ ] Discovery paths: `<project>/.agents/skills/`, `~/.agents/skills/`, managed bundles
-- [ ] Scope precedence: project > user > managed; детерминированные collisions с диагностикой
-- [ ] Progressive disclosure: в каталог только name+description; тело — по активации
-- [ ] Fixtures: minimal, malformed-yaml, collision, untrusted-script
+- [x] Парсер `SKILL.md` (YAML frontmatter: `name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools`)
+- [x] Strict validation + lenient diagnostics режимы
+- [x] Discovery paths: `<project>/.agents/skills/`, `~/.agents/skills/`, managed bundles
+- [x] Scope precedence: project > user > managed; детерминированные collisions с диагностикой
+- [x] Progressive disclosure: в каталог только name+description; тело — по активации (`catalog_entry()`)
+- [x] Fixtures: minimal, malformed-yaml, collision, untrusted-script
 
 ### 4.2 Trust и bundles
 
