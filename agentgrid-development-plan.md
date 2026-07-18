@@ -161,11 +161,11 @@
 
 ### 4.2 Trust и bundles
 
-- [ ] Trust gate: project skills не активируются без явного trust (защита от malicious repo)
-- [ ] Skill bundle manifest: источники (filesystem/git), pin по commit/hash, lock-файл
-- [ ] Hash verification при материализации
-- [ ] Materialization в agent-specific paths на node (для минимум двух разных agents)
-- [ ] Profile revision: иммутабельные ревизии, транзакционная активация, rollback
+- [x] Trust gate: project skills не активируются без явного trust (защита от malicious repo)
+- [x] Skill bundle manifest: источники (filesystem/git), pin по commit/hash, lock-файл
+- [x] Hash verification при материализации
+- [x] Materialization в agent-specific paths на node (примитив `materialize(dest)`; dest задаётся вызывающим per-agent)
+- [x] Profile revision: иммутабельные ревизии, транзакционная активация, rollback (`RevisionStore`)
 - [ ] Интеграционный тест: OpenCode/mock agent с активированным skill выполняет задачу
 - [ ] E2E: один bundle материализуется одинаково на локальной и удалённой node
 

@@ -207,7 +207,7 @@ fn extract_frontmatter(content: &str) -> Result<(Vec<&str>, String), String> {
     Ok((fm, body))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkillSource {
     /// Highest precedence: `<project>/.agents/skills`.
     Project = 0,
@@ -312,6 +312,9 @@ pub fn standard_roots(
     }
     roots
 }
+
+mod bundle;
+pub use bundle::*;
 
 #[cfg(test)]
 mod tests {
