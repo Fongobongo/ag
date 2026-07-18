@@ -82,6 +82,7 @@ async fn create_and_assign(app: &Router, node_id: &str, cred: &str, prompt: &str
         requested_node_id: None,
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()

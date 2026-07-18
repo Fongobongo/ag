@@ -150,6 +150,7 @@ async fn create_and_assign(app: &Router, node_id: &str, cred: &str, prompt: &str
         requested_node_id: None,
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()
@@ -327,6 +328,7 @@ async fn validation_failure_must_not_report_success() {
         requested_node_id: None,
         timeout_secs: None,
         validation_command: Some("false".into()),
+        base_commit: None,
     };
     let resp = app
         .clone()
@@ -419,6 +421,7 @@ async fn cancel_queued_marks_cancelled() {
         requested_node_id: None,
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()
@@ -755,6 +758,7 @@ async fn user_auth_setup_login_and_protects_endpoints() {
                 requested_node_id: None,
                 timeout_secs: None,
                 validation_command: None,
+                base_commit: None,
             })
             .unwrap(),
             None,
@@ -779,6 +783,7 @@ async fn user_auth_setup_login_and_protects_endpoints() {
                 requested_node_id: None,
                 timeout_secs: None,
                 validation_command: None,
+                base_commit: None,
             })
             .unwrap(),
             Some(&token),
@@ -796,6 +801,7 @@ async fn create_task_only(app: &Router, repo: &str, adapter: &str, node: Option<
         requested_node_id: node,
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()
@@ -917,6 +923,7 @@ async fn oversized_prompt_returns_413() {
         requested_node_id: None,
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()
@@ -935,6 +942,7 @@ async fn create_task(app: &Router, adapter: &str, requested_node: Option<&str>) 
         requested_node_id: requested_node.map(|s| s.into()),
         timeout_secs: None,
         validation_command: None,
+        base_commit: None,
     };
     let resp = app
         .clone()

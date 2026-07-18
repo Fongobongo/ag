@@ -184,6 +184,7 @@ mod tests {
             git_url: git_url.into(),
             default_branch: default_branch.into(),
             validation_command: None,
+            base_commit: None,
         }
     }
 

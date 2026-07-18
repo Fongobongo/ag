@@ -489,14 +489,15 @@ impl Store {
         let now = now_iso();
         let timeout_secs = req.timeout_secs.unwrap_or(3600) as i64;
         sqlx::query(
-            "INSERT INTO tasks (id, repository, prompt, adapter, requested_node_id, status, created_at, timeout_secs, validation_command) \
-             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO tasks (id, repository, prompt, adapter, requested_node_id, base_commit, status, created_at, timeout_secs, validation_command) \
+             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
         )
         .bind(&id)
         .bind(&req.repository)
         .bind(&req.prompt)
         .bind(&req.adapter)
         .bind(&req.requested_node_id)
+        .bind(&req.base_commit)
         .bind(&now)
         .bind(timeout_secs)
         .bind(&req.validation_command)
@@ -514,12 +515,13 @@ impl Store {
             validation_command: req.validation_command.clone(),
             error_code: None,
             requested_node_id: req.requested_node_id.clone(),
+            base_commit: req.base_commit.clone(),
         })
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TaskView>> {
         let rows = sqlx::query(
-            "SELECT id, repository, prompt, adapter, status, created_at, finished_at, assigned_attempt_id, validation_command, error_code, requested_node_id \
+            "SELECT id, repository, prompt, adapter, status, created_at, finished_at, assigned_attempt_id, validation_command, error_code, requested_node_id, base_commit \
              FROM tasks ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -529,7 +531,7 @@ impl Store {
 
     pub async fn show_task(&self, id: &str) -> Result<Option<TaskView>> {
         let row = sqlx::query(
-            "SELECT id, repository, prompt, adapter, status, created_at, finished_at, assigned_attempt_id, validation_command, error_code, requested_node_id \
+            "SELECT id, repository, prompt, adapter, status, created_at, finished_at, assigned_attempt_id, validation_command, error_code, requested_node_id, base_commit \
              FROM tasks WHERE id = ?",
         )
         .bind(id)
@@ -664,7 +666,7 @@ impl Store {
     pub async fn try_assign(&self, node_id: &str) -> Result<Option<Assignment>> {
         let mut tx = self.pool.begin().await?;
         let cands = sqlx::query(
-            "SELECT id, prompt, adapter, repository, timeout_secs, validation_command FROM tasks \
+            "SELECT id, prompt, adapter, repository, timeout_secs, validation_command, base_commit FROM tasks \
              WHERE status = 'queued' AND (requested_node_id IS NULL OR requested_node_id = ?) \
              ORDER BY created_at ASC",
         )
@@ -678,6 +680,7 @@ impl Store {
             let repository: String = c.try_get("repository")?;
             let timeout_secs: i64 = c.try_get("timeout_secs")?;
             let task_validation: Option<String> = c.try_get("validation_command")?;
+            let base_commit: Option<String> = c.try_get("base_commit").ok().flatten();
 
             // Resolve repository git info (absent for plain-dir tasks).
             let repo = sqlx::query(
@@ -759,6 +762,7 @@ impl Store {
                 git_url,
                 default_branch,
                 validation_command: task_validation.or(validation_command),
+                base_commit,
             }));
         }
 
@@ -1352,6 +1356,7 @@ fn row_to_task_view(r: &sqlx::sqlite::SqliteRow) -> TaskView {
         validation_command: r.try_get("validation_command").unwrap_or_default(),
         error_code: r.try_get("error_code").unwrap_or_default(),
         requested_node_id: r.try_get("requested_node_id").unwrap_or_default(),
+        base_commit: r.try_get("base_commit").unwrap_or_default(),
     }
 }
 
@@ -1652,6 +1657,7 @@ impl Store {
         template_id: &str,
         context: Option<&str>,
         repository: Option<&str>,
+        base_commit: Option<&str>,
     ) -> Result<WorkflowRun> {
         let tpl = self
             .get_workflow_template(template_id)
@@ -1661,13 +1667,14 @@ impl Store {
         let created_at = now_iso();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO workflow_runs (id, template_id, status, context, repository, created_at, finished_at) \
-             VALUES (?, ?, 'pending', ?, ?, ?, NULL)",
+            "INSERT INTO workflow_runs (id, template_id, status, context, repository, base_commit, created_at, finished_at) \
+             VALUES (?, ?, 'pending', ?, ?, ?, ?, NULL)",
         )
         .bind(&run_id)
         .bind(template_id)
         .bind(context)
         .bind(repository)
+        .bind(base_commit)
         .bind(&created_at)
         .execute(&mut *tx)
         .await?;
@@ -1676,8 +1683,8 @@ impl Store {
             let depends_json = serde_json::to_string(&step.depends_on)?;
             sqlx::query(
                 "INSERT INTO workflow_steps \
-                 (id, run_id, step_id, prompt, depends_on, role, adapter, requested_node_id, status, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                 (id, run_id, step_id, prompt, depends_on, role, adapter, requested_node_id, base_commit, retryable, max_attempts, attempts, status, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
             )
             .bind(&step_run_id)
             .bind(&run_id)
@@ -1687,6 +1694,10 @@ impl Store {
             .bind(role_str(step.role))
             .bind(&step.adapter)
             .bind(step.requested_node_id.as_deref())
+            .bind(step.base_commit.as_deref())
+            .bind(step.retryable.map(|b| if b { 1i64 } else { 0 }))
+            .bind(step.max_attempts.map(|m| m as i64))
+            .bind(0i64)
             .bind(&created_at)
             .execute(&mut *tx)
             .await?;
@@ -1711,12 +1722,13 @@ impl Store {
             finished_at: None,
             context: context.map(|s| s.to_string()),
             repository: repository.map(|s| s.to_string()),
+            base_commit: base_commit.map(|s| s.to_string()),
         })
     }
 
     pub async fn get_workflow_run(&self, id: &str) -> Result<Option<WorkflowRun>> {
         let row = sqlx::query(
-            "SELECT id, template_id, status, context, repository, created_at, finished_at \
+            "SELECT id, template_id, status, context, repository, base_commit, created_at, finished_at \
              FROM workflow_runs WHERE id = ?",
         )
         .bind(id)
@@ -1731,12 +1743,17 @@ impl Store {
             finished_at: r.try_get("finished_at").ok(),
             context: r.try_get("context").ok(),
             repository: r.try_get("repository").ok(),
+            base_commit: r
+                .try_get::<Option<String>, _>("base_commit")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty()),
         }))
     }
 
     pub async fn list_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
         let rows = sqlx::query(
-            "SELECT id, template_id, status, context, repository, created_at, finished_at \
+            "SELECT id, template_id, status, context, repository, base_commit, created_at, finished_at \
              FROM workflow_runs ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -1752,13 +1769,18 @@ impl Store {
                 finished_at: r.try_get("finished_at").ok(),
                 context: r.try_get("context").ok(),
                 repository: r.try_get("repository").ok(),
+                base_commit: r
+                    .try_get::<Option<String>, _>("base_commit")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.is_empty()),
             })
             .collect())
     }
 
     pub async fn get_workflow_run_steps(&self, run_id: &str) -> Result<Vec<WorkflowStepRun>> {
         let rows = sqlx::query(
-            "SELECT id, run_id, step_id, prompt, depends_on, role, adapter, requested_node_id, status, created_at \
+            "SELECT id, run_id, step_id, prompt, depends_on, role, adapter, requested_node_id, base_commit, retryable, max_attempts, attempts, status, created_at \
              FROM workflow_steps WHERE run_id = ? ORDER BY created_at ASC",
         )
         .bind(run_id)
@@ -1786,21 +1808,27 @@ impl Store {
                     .ok()
                     .flatten()
                     .filter(|s| !s.is_empty()),
+                base_commit: r
+                    .try_get::<Option<String>, _>("base_commit")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.is_empty()),
+                retryable: r
+                    .try_get::<Option<i64>, _>("retryable")
+                    .ok()
+                    .flatten()
+                    .map(|v| v != 0),
+                max_attempts: r
+                    .try_get::<Option<i64>, _>("max_attempts")
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u32),
+                attempts: r.try_get::<i64, _>("attempts").unwrap_or(0) as u32,
                 status: from_snake(&r.try_get::<String, _>("status").unwrap_or_default())
                     .unwrap_or(agentgrid_common::WorkflowStepStatus::Pending),
                 created_at: r.try_get("created_at").unwrap_or_default(),
             })
             .collect())
-    }
-
-    /// Map a terminal task status to a workflow step status (or `None` if the
-    /// task is still running).
-    fn task_to_step_status(t: &TaskStatus) -> Option<WorkflowStepStatus> {
-        match t {
-            TaskStatus::Succeeded => Some(WorkflowStepStatus::Succeeded),
-            TaskStatus::Failed | TaskStatus::Cancelled => Some(WorkflowStepStatus::Failed),
-            _ => None,
-        }
     }
 
     async fn set_workflow_run_status(
@@ -1821,6 +1849,16 @@ impl Store {
     async fn set_step_status(&self, step_run_id: &str, status: WorkflowStepStatus) -> Result<()> {
         sqlx::query("UPDATE workflow_steps SET status = ? WHERE id = ?")
             .bind(role_str_status(status))
+            .bind(step_run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Stage 8: bump the attempt counter used by the lost-step retry policy.
+    async fn set_step_attempts(&self, step_run_id: &str, attempts: u32) -> Result<()> {
+        sqlx::query("UPDATE workflow_steps SET attempts = ? WHERE id = ?")
+            .bind(attempts as i64)
             .bind(step_run_id)
             .execute(&self.pool)
             .await?;
@@ -1904,9 +1942,58 @@ impl Store {
                 WorkflowStepStatus::Running => {
                     if let Some(task_id) = self.step_task_id(&step.id).await? {
                         if let Some(ts) = self.get_task_status(&task_id).await? {
-                            if let Some(next) = Self::task_to_step_status(&ts) {
-                                self.set_step_status(&step.id, next).await?;
-                                self.set_role_run_status_by_step(&step.id, next).await?;
+                            match ts {
+                                TaskStatus::Succeeded => {
+                                    self.set_step_status(&step.id, WorkflowStepStatus::Succeeded)
+                                        .await?;
+                                    self.set_role_run_status_by_step(
+                                        &step.id,
+                                        WorkflowStepStatus::Succeeded,
+                                    )
+                                    .await?;
+                                }
+                                TaskStatus::Failed => {
+                                    // Stage 8 lost-step recovery: a side-effectful
+                                    // step must not be auto-retried unless it opted in.
+                                    // `node_lost` is treated the same as any other
+                                    // failure (default = step fails).
+                                    let attempts = step.attempts + 1;
+                                    self.set_step_attempts(&step.id, attempts).await?;
+                                    let max = step.max_attempts.unwrap_or(1);
+                                    let retryable = step.retryable.unwrap_or(false);
+                                    if retryable && attempts < max {
+                                        let req = CreateTaskRequest {
+                                            prompt: step.prompt.clone(),
+                                            repository: repo.clone(),
+                                            adapter: step
+                                                .adapter
+                                                .clone()
+                                                .filter(|a| !a.is_empty())
+                                                .unwrap_or_else(|| "mock".to_string()),
+                                            requested_node_id: step.requested_node_id.clone(),
+                                            timeout_secs: None,
+                                            validation_command: None,
+                                            base_commit: step
+                                                .base_commit
+                                                .clone()
+                                                .or_else(|| run.base_commit.clone()),
+                                        };
+                                        let tv = self.create_task(&req).await?;
+                                        self.set_role_run_task(&step.id, &tv.id).await?;
+                                        created.push(tv.id);
+                                        // step stays `Running` pending the retry
+                                    } else {
+                                        self.set_step_status(&step.id, WorkflowStepStatus::Failed)
+                                            .await?;
+                                        self.set_role_run_status_by_step(
+                                            &step.id,
+                                            WorkflowStepStatus::Failed,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                // Cancelled / still in flight: leave the step as-is.
+                                _ => {}
                             }
                         }
                     }
@@ -1927,6 +2014,10 @@ impl Store {
                             requested_node_id: step.requested_node_id.clone(),
                             timeout_secs: None,
                             validation_command: None,
+                            base_commit: step
+                                .base_commit
+                                .clone()
+                                .or_else(|| run.base_commit.clone()),
                         };
                         let tv = self.create_task(&req).await?;
                         self.set_role_run_task(&step.id, &tv.id).await?;
@@ -1993,6 +2084,9 @@ mod workflow_tests {
             role,
             adapter: None,
             requested_node_id: None,
+            base_commit: None,
+            retryable: None,
+            max_attempts: None,
         }
     }
 
@@ -2019,7 +2113,7 @@ mod workflow_tests {
         assert_eq!(got.steps.len(), 3);
 
         let run = s
-            .create_workflow_run(&tpl.id, Some(r#"{"branch":"feat"}"#), None)
+            .create_workflow_run(&tpl.id, Some(r#"{"branch":"feat"}"#), None, None)
             .await
             .unwrap();
         assert_eq!(run.status, WorkflowRunStatus::Pending);
@@ -2044,7 +2138,10 @@ mod workflow_tests {
     #[tokio::test]
     async fn unknown_template_rejected_on_run() {
         let s = temp_store().await;
-        assert!(s.create_workflow_run("wft-nope", None, None).await.is_err());
+        assert!(s
+            .create_workflow_run("wft-nope", None, None, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -2056,7 +2153,7 @@ mod workflow_tests {
             .await
             .unwrap();
         let run = s
-            .create_workflow_run(&tpl.id, None, Some("demo"))
+            .create_workflow_run(&tpl.id, None, Some("demo"), None)
             .await
             .unwrap();
         let created = s.tick_workflow_run(&run.id).await.unwrap();
@@ -2081,10 +2178,13 @@ mod workflow_tests {
             role: WorkflowRole::Worker,
             adapter: None,
             requested_node_id: Some("node-pinned".into()),
+            base_commit: None,
+            retryable: None,
+            max_attempts: None,
         }];
         let tpl = s.create_workflow_template("pin", &steps).await.unwrap();
         let run = s
-            .create_workflow_run(&tpl.id, None, Some("demo"))
+            .create_workflow_run(&tpl.id, None, Some("demo"), None)
             .await
             .unwrap();
         let created = s.tick_workflow_run(&run.id).await.unwrap();
@@ -2096,5 +2196,87 @@ mod workflow_tests {
             steps_run[0].requested_node_id.as_deref(),
             Some("node-pinned")
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_run_carries_base_commit() {
+        let s = temp_store().await;
+        let steps = vec![step("a", &[], WorkflowRole::Worker)];
+        let tpl = s.create_workflow_template("t", &steps).await.unwrap();
+        let run = s
+            .create_workflow_run(&tpl.id, None, Some("demo"), Some("deadbeef"))
+            .await
+            .unwrap();
+        assert_eq!(run.base_commit.as_deref(), Some("deadbeef"));
+        let created = s.tick_workflow_run(&run.id).await.unwrap();
+        assert_eq!(created.len(), 1);
+        let task = s.show_task(&created[0]).await.unwrap().unwrap();
+        assert_eq!(task.base_commit.as_deref(), Some("deadbeef"));
+        let run_got = s.get_workflow_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(run_got.base_commit.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn retryable_step_retries_then_succeeds() {
+        let s = temp_store().await;
+        let steps = vec![agentgrid_common::WorkflowStep {
+            id: "a".into(),
+            prompt: "do a".into(),
+            depends_on: vec![],
+            role: WorkflowRole::Worker,
+            adapter: None,
+            requested_node_id: None,
+            base_commit: None,
+            retryable: Some(true),
+            max_attempts: Some(3),
+        }];
+        let tpl = s.create_workflow_template("retry", &steps).await.unwrap();
+        let run = s
+            .create_workflow_run(&tpl.id, None, Some("demo"), None)
+            .await
+            .unwrap();
+        let poll = agentgrid_common::PollRequest {
+            node_id: "n1".into(),
+            name: "n1".into(),
+            adapters: vec!["mock".into()],
+            repositories: vec!["*".into()],
+            max_concurrency: 2,
+        };
+        s.register_or_touch_node(&poll).await.unwrap();
+
+        // Tick -> first task.
+        let created = s.tick_workflow_run(&run.id).await.unwrap();
+        assert_eq!(created.len(), 1);
+        // Assign + fail it; retryable step should respawn.
+        let a1 = s.try_assign("n1").await.unwrap().unwrap();
+        s.complete_attempt(
+            &a1.attempt_id,
+            &agentgrid_common::CompleteAttemptRequest {
+                exit_code: 1,
+                commit_sha: None,
+                error_code: Some("agent_failed".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let created2 = s.tick_workflow_run(&run.id).await.unwrap();
+        assert_eq!(created2.len(), 1, "retryable step must respawn a task");
+        let steps_run = s.get_workflow_run_steps(&run.id).await.unwrap();
+        assert_eq!(steps_run[0].attempts, 1);
+        // Assign + succeed the retry.
+        let a2 = s.try_assign("n1").await.unwrap().unwrap();
+        s.complete_attempt(
+            &a2.attempt_id,
+            &agentgrid_common::CompleteAttemptRequest {
+                exit_code: 0,
+                commit_sha: None,
+                error_code: None,
+            },
+        )
+        .await
+        .unwrap();
+        s.tick_workflow_run(&run.id).await.unwrap();
+        let run_got = s.get_workflow_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(run_got.status, WorkflowRunStatus::Succeeded);
     }
 }

@@ -686,7 +686,12 @@ async fn create_workflow_run(
 ) -> Result<(StatusCode, Json<WorkflowRun>), StatusCode> {
     state
         .store
-        .create_workflow_run(&id, req.context.as_deref(), req.repository.as_deref())
+        .create_workflow_run(
+            &id,
+            req.context.as_deref(),
+            req.repository.as_deref(),
+            req.base_commit.as_deref(),
+        )
         .await
         .map(|r| (StatusCode::CREATED, Json(r)))
         .map_err(|e| {

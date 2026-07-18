@@ -1453,6 +1453,7 @@ mod tests {
             git_url: String::new(),
             default_branch: String::new(),
             validation_command: None,
+            base_commit: None,
         };
         let sink = EventSink::new(
             assignment.attempt_id.clone(),

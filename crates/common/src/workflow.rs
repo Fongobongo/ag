@@ -74,6 +74,18 @@ pub struct WorkflowStep {
     /// (Stage 8: node affinity). `None` lets the scheduler pick any eligible node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_node_id: Option<String>,
+    /// Optional exact commit all attempts of this step start from (Stage 8
+    /// shared base_commit). Overrides the run-level `base_commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// If `true`, a failed/lost attempt is retried up to `max_attempts`
+    /// (Stage 8 lost-step recovery). Side-effectful steps must opt in; the
+    /// default (unset) never auto-retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// Max attempts including the first; default 1 (no retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
 }
 
 /// A reusable workflow definition (the DAG).
@@ -100,6 +112,11 @@ pub struct WorkflowRun {
     /// Target repository the step tasks run against (optional; v1: whole run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Shared base_commit for every step's attempts (Stage 8): parallel workers
+    /// of one run start from the same commit. `None` => each task branches from
+    /// its repository `default_branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
 }
 
 /// A step instance inside a run.
@@ -115,6 +132,18 @@ pub struct WorkflowStepRun {
     /// Optional placement constraint (Stage 8): node this step's task is pinned to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_node_id: Option<String>,
+    /// Exact commit this step's attempts start from (Stage 8), if pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Retryable step? (Stage 8 lost-step recovery.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// Max attempts including the first (Stage 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    /// Attempts made so far for this step (Stage 8).
+    #[serde(default)]
+    pub attempts: u32,
     pub status: WorkflowStepStatus,
     pub created_at: String,
 }
@@ -137,6 +166,9 @@ pub struct CreateWorkflowRunRequest {
     /// Target repository for the step tasks (optional; defaults to none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Shared base_commit for every step (optional; Stage 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
 }
 
 /// `GET /v1/workflow-runs/{id}` response: the run plus its step instances.

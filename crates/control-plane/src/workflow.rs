@@ -98,6 +98,9 @@ mod tests {
             role: WorkflowRole::Worker,
             adapter: None,
             requested_node_id: None,
+            base_commit: None,
+            retryable: None,
+            max_attempts: None,
         }
     }
 

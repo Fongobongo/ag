@@ -248,6 +248,7 @@ impl AcpAgent for GatewayAgent {
             requested_node_id: None,
             timeout_secs: Some(3600),
             validation_command: None,
+            base_commit: None,
         };
         let task_id = self.create_task(&req).await?;
         if let Some(m) = self.sessions.lock().unwrap().get_mut(&p.session_id) {

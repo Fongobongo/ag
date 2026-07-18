@@ -260,6 +260,7 @@ async fn cmd_run(client: &reqwest::Client, base: &str, a: RunArgs) -> Result<()>
         requested_node_id: a.node,
         timeout_secs: a.timeout,
         validation_command: a.validate,
+        base_commit: None,
     };
     let resp = client
         .post(format!("{base}/v1/tasks"))
@@ -725,7 +726,11 @@ async fn cmd_workflow_show(
 }
 
 async fn cmd_workflow_run(client: &reqwest::Client, base: &str, a: WorkflowRunArgs) -> Result<()> {
-    let req = CreateWorkflowRunRequest { context: a.context };
+    let req = CreateWorkflowRunRequest {
+        context: a.context,
+        repository: None,
+        base_commit: None,
+    };
     let resp = client
         .post(format!("{base}/v1/workflows/{}/runs", a.template_id))
         .json(&req)

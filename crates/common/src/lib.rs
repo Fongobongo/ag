@@ -236,6 +236,10 @@ pub struct CreateTaskRequest {
     /// Optional validation command overriding the repository default.
     #[serde(default)]
     pub validation_command: Option<String>,
+    /// Optional exact commit the node should check out for the worktree
+    /// (Stage 8: shared base_commit). `None` => branch from `default_branch`.
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,6 +263,10 @@ pub struct TaskView {
     /// workflow placement). `None` => scheduler picks any eligible node.
     #[serde(default)]
     pub requested_node_id: Option<String>,
+    /// Exact commit the node checked out for the worktree (Stage 8), if the
+    /// task was pinned to one. `None` => branched from `default_branch`.
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,6 +312,9 @@ pub struct Assignment {
     /// Optional validation command run after the agent succeeds (Stage 3.3).
     #[serde(default)]
     pub validation_command: Option<String>,
+    /// Optional exact commit the node should check out (Stage 8 base_commit).
+    #[serde(default)]
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,6 +565,7 @@ mod tests {
             requested_node_id: Some("node-1".into()),
             timeout_secs: None,
             validation_command: None,
+            base_commit: None,
         };
         assert_eq!(round_trip(&req), req);
 
@@ -578,6 +590,7 @@ mod tests {
                 git_url: String::new(),
                 default_branch: String::new(),
                 validation_command: None,
+                base_commit: None,
             }),
         };
         assert_eq!(round_trip(&pr), pr);
