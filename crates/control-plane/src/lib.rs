@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agentgrid_common::{
-    CancelState, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
-    EnrollResponse, EnrollTokenResponse, EventsQuery, HeartbeatRequest, IngestEventsRequest,
-    LoginRequest, LoginResponse, PollRequest, PollResponse, RepositoryView, SetupRequest,
-    TaskEligibility, TaskView, UploadArtifactRequest,
+    CancelState, CompleteAttemptRequest, CreateAgentSessionRequest, CreateRepositoryRequest,
+    CreateTaskRequest, EnrollRequest, EnrollResponse, EnrollTokenResponse, EventsQuery,
+    HeartbeatRequest, IngestEventsRequest, LoginRequest, LoginResponse, PollRequest, PollResponse,
+    RepositoryView, SetupRequest, TaskEligibility, TaskView, UploadArtifactRequest,
 };
 use axum::{
     body::Body,
@@ -192,6 +192,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/node/attempts/{id}/events", post(ingest_events))
         .route("/v1/node/attempts/{id}/complete", post(complete_attempt))
         .route("/v1/node/attempts/{id}/ack", post(ack_attempt_handler))
+        .route(
+            "/v1/node/attempts/{id}/session",
+            post(create_agent_session_handler),
+        )
         .route("/v1/node/attempts/{id}/artifacts", post(upload_artifact))
         .route("/v1/tasks/{id}/artifacts/{name}", get(get_artifact))
         .layer(DefaultBodyLimit::max(state.limits.artifact))
@@ -966,6 +970,28 @@ async fn ack_attempt_handler(
         Err(e) => {
             tracing::error!("ack_attempt failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn create_agent_session_handler(
+    State(state): State<Arc<AppState>>,
+    Path(attempt_id): Path<String>,
+    Json(req): Json<CreateAgentSessionRequest>,
+) -> Response {
+    match state
+        .store
+        .create_agent_session(&attempt_id, &req.adapter)
+        .await
+    {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "session_id": id })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("create_agent_session failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
 }

@@ -183,6 +183,24 @@ pub struct AgentEventEnvelope {
     pub raw_ref: Option<String>,
 }
 
+/// Request to open an agent session for an attempt (Stage 3.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgentSessionRequest {
+    pub adapter: String,
+}
+
+/// A single agent execution inside an attempt (Stage 3.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub id: String,
+    pub attempt_id: String,
+    pub adapter: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub status: String,
+    pub error_code: Option<String>,
+}
+
 // ----- API DTOs -----
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -8,11 +8,11 @@
 use std::time::Duration;
 
 use agentgrid_common::{
-    next_attempt_status, next_task_status, Assignment, AttemptStatus, AttemptTransition,
-    CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
-    EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest, NodeEligibility, NodeStatus,
-    NodeView, PollRequest, RepositoryView, TaskEligibility, TaskEvent, TaskStatus, TaskTransition,
-    TaskView, UploadArtifactRequest,
+    next_attempt_status, next_task_status, AgentSession, Assignment, AttemptStatus,
+    AttemptTransition, CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest,
+    EnrollRequest, EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest,
+    NodeEligibility, NodeStatus, NodeView, PollRequest, RepositoryView, TaskEligibility, TaskEvent,
+    TaskStatus, TaskTransition, TaskView, UploadArtifactRequest,
 };
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
@@ -131,6 +131,16 @@ impl Store {
             .execute(&pool)
             .await
             .map_err(|e| anyhow::anyhow!("sqlite quick_check failed: {e}"))?;
+        // Warm the schema cookie on every pooled connection. A connection
+        // opened after the migrations ran still recompiles statements against
+        // migrated tables on first use, which is slow and briefly locks; a
+        // throwaway read on each connection avoids that cost on hot paths.
+        for _ in 0..4 {
+            let mut c = pool.acquire().await?;
+            sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .execute(&mut *c)
+                .await?;
+        }
         let artifact_root = std::path::Path::new(db_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -918,6 +928,14 @@ impl Store {
         // node reports validation/timeout failures via `error_code` even when the
         // agent process exits 0, so exit 0 alone must not be treated as success.
         let success = req.exit_code == 0 && req.error_code.as_deref().is_none();
+        // Stage 3.2: close any open agent session for this attempt.
+        self.finish_agent_session(
+            &mut tx,
+            attempt_id,
+            if success { "done" } else { "failed" },
+            req.error_code.as_deref(),
+        )
+        .await?;
         let at = if success {
             AttemptTransition::Succeed
         } else {
@@ -1010,6 +1028,67 @@ impl Store {
             .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Stage 3.2: open an agent session for an attempt. Returns the new
+    /// session id. The node opens at most one session per attempt (best-effort).
+    pub async fn create_agent_session(&self, attempt_id: &str, adapter: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO agent_sessions (id, attempt_id, adapter, started_at, status) \
+             VALUES (?, ?, ?, ?, 'running')",
+        )
+        .bind(&id)
+        .bind(attempt_id)
+        .bind(adapter)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Stage 3.2: close any open session for an attempt (idempotent: only
+    /// updates sessions still running). Called when the attempt completes.
+    pub async fn finish_agent_session(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        status: &str,
+        error_code: Option<&str>,
+    ) -> Result<()> {
+        let now = now_iso();
+        sqlx::query(
+            "UPDATE agent_sessions SET ended_at = ?, status = ?, error_code = ? \
+             WHERE attempt_id = ? AND ended_at IS NULL",
+        )
+        .bind(&now)
+        .bind(status)
+        .bind(error_code)
+        .bind(attempt_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Stage 3.2: fetch a single agent session by id (tests/reporting).
+    pub async fn get_agent_session(&self, id: &str) -> Result<Option<AgentSession>> {
+        let row = sqlx::query(
+            "SELECT id, attempt_id, adapter, started_at, ended_at, status, error_code \
+             FROM agent_sessions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| AgentSession {
+            id: r.try_get("id").unwrap_or_default(),
+            attempt_id: r.try_get("attempt_id").unwrap_or_default(),
+            adapter: r.try_get("adapter").unwrap_or_default(),
+            started_at: r.try_get("started_at").unwrap_or_default(),
+            ended_at: r.try_get("ended_at").ok(),
+            status: r.try_get("status").unwrap_or_default(),
+            error_code: r.try_get("error_code").ok(),
+        }))
     }
 
     /// Explicit assignment acknowledgement (Stage 1.3): atomically flips an

@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use agentgrid_adapters::{to_event_type, AdapterEvent};
 use agentgrid_common::{
-    AgentEventEnvelope, Assignment, CancelState, CompleteAttemptRequest, EnrollRequest,
-    EnrollResponse, EventType, HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus,
-    PollRequest, PollResponse, UploadArtifactRequest,
+    AgentEventEnvelope, Assignment, CancelState, CompleteAttemptRequest, CreateAgentSessionRequest,
+    EnrollRequest, EnrollResponse, EventType, HeartbeatRequest, IncomingEvent, IngestEventsRequest,
+    NodeStatus, PollRequest, PollResponse, UploadArtifactRequest,
 };
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -431,6 +431,13 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     // reassigned (double-attempt). After ack the attempt is 'running' and the
     // revert no longer applies (Stage 1.3).
     ack_attempt(&client, &cfg.server, &assignment.attempt_id).await;
+    create_agent_session(
+        &client,
+        &cfg.server,
+        &assignment.attempt_id,
+        &assignment.adapter,
+    )
+    .await;
     let flusher = tokio::spawn(sink.clone().run_flusher());
 
     let r1 = tokio::spawn(read_stream(
@@ -729,6 +736,23 @@ async fn ack_attempt(client: &reqwest::Client, server: &str, attempt_id: &str) {
     let url = format!("{}/v1/node/attempts/{}/ack", server, attempt_id);
     if let Err(e) = client.post(&url).send().await {
         tracing::warn!("ack failed for {attempt_id}: {e}");
+    }
+}
+
+/// Stage 3.2: open an agent session for this attempt (best-effort; a failed
+/// CP call only warns, it must not block the attempt).
+async fn create_agent_session(
+    client: &reqwest::Client,
+    server: &str,
+    attempt_id: &str,
+    adapter: &str,
+) {
+    let url = format!("{}/v1/node/attempts/{}/session", server, attempt_id);
+    let req = CreateAgentSessionRequest {
+        adapter: adapter.to_string(),
+    };
+    if let Err(e) = client.post(&url).json(&req).send().await {
+        tracing::warn!("agent session create failed for {attempt_id}: {e}");
     }
 }
 
