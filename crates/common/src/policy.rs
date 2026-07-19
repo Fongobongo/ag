@@ -32,6 +32,26 @@ pub enum RiskClass {
     Destructive,
 }
 
+/// Autonomy level (Stage 9.2). Higher level = the agent may act more on its own;
+/// lower level keeps a human in the loop. Stored per profile; the builtin
+/// provider defaults to `L2` (can patch/edit locally, asks before anything that
+/// touches the network/remote/installs, denies destructive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutonomyLevel {
+    /// Fully supervised: every non-trivial action must be approved; destructive denied.
+    L0,
+    /// Read-only helpers: reads allowed, everything else asked.
+    L1,
+    /// Local patching: read/edit/exec allowed, network/install asked, destructive denied.
+    #[default]
+    L2,
+    /// Local dev: read/edit/exec/network/git allowed, install asked, destructive denied.
+    L3,
+    /// Full autonomy: everything allowed, including destructive (use with care).
+    L4,
+}
+
 /// Provider decision for a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,17 +102,38 @@ impl BuiltinPolicyProvider {
         BuiltinPolicyProvider
     }
 
-    /// Default decision matrix: dangerous classes are denied/asked, benign
-    /// classes allowed. Plug in a stricter provider for `strict` profiles.
-    fn decide(class: RiskClass) -> PolicyDecision {
-        match class {
-            RiskClass::Read => PolicyDecision::Allow,
-            RiskClass::EditWorkspace => PolicyDecision::Allow,
-            RiskClass::ExecuteLocal => PolicyDecision::Allow,
-            RiskClass::NetworkWrite => PolicyDecision::Ask,
-            RiskClass::GitRemote => PolicyDecision::Ask,
-            RiskClass::PackageInstall => PolicyDecision::Ask,
-            RiskClass::Destructive => PolicyDecision::Deny,
+    /// Default decision per risk class at the default autonomy level (`L2`).
+    pub fn decide(class: RiskClass) -> PolicyDecision {
+        Self::decide_for(AutonomyLevel::default(), class)
+    }
+
+    /// Decision matrix per autonomy level. Higher level permits more.
+    pub fn decide_for(level: AutonomyLevel, class: RiskClass) -> PolicyDecision {
+        use AutonomyLevel::*;
+        use RiskClass::*;
+        match level {
+            L0 => match class {
+                Destructive => PolicyDecision::Deny,
+                _ => PolicyDecision::Ask,
+            },
+            L1 => match class {
+                Read => PolicyDecision::Allow,
+                Destructive => PolicyDecision::Deny,
+                _ => PolicyDecision::Ask,
+            },
+            L2 => match class {
+                Read | EditWorkspace | ExecuteLocal => PolicyDecision::Allow,
+                NetworkWrite | GitRemote | PackageInstall => PolicyDecision::Ask,
+                Destructive => PolicyDecision::Deny,
+            },
+            L3 => match class {
+                Read | EditWorkspace | ExecuteLocal | NetworkWrite | GitRemote => {
+                    PolicyDecision::Allow
+                }
+                PackageInstall => PolicyDecision::Ask,
+                Destructive => PolicyDecision::Deny,
+            },
+            L4 => PolicyDecision::Allow,
         }
     }
 }
@@ -104,25 +145,32 @@ impl Default for BuiltinPolicyProvider {
 }
 
 impl CommandPolicyProvider for BuiltinPolicyProvider {
-    fn evaluate(&self, command: &str, _cwd: &str) -> Result<PolicyVerdict, PolicyError> {
-        // Tokenize respecting simple single/double quotes so `rm -rf "a b"`
-        // is one argument. An unterminated quote is a parse failure → ask.
+    fn evaluate(&self, command: &str, cwd: &str) -> Result<PolicyVerdict, PolicyError> {
+        self.evaluate_with(AutonomyLevel::default(), command, cwd)
+    }
+}
+
+impl BuiltinPolicyProvider {
+    /// Classify `command` for a specific autonomy level.
+    pub fn evaluate_with(
+        &self,
+        level: AutonomyLevel,
+        command: &str,
+        _cwd: &str,
+    ) -> Result<PolicyVerdict, PolicyError> {
         let tokens = match tokenize(command) {
             Some(t) => t,
-            None => {
-                return Ok(PolicyVerdict::fail_closed("command tokenization failed"));
-            }
+            None => return Ok(PolicyVerdict::fail_closed("command tokenization failed")),
         };
         if tokens.is_empty() {
             return Ok(PolicyVerdict::fail_closed("empty command"));
         }
         let class = classify(&tokens);
-        let decision = Self::decide(class);
-        let reason = format!("builtin classifier → {class:?}");
+        let decision = Self::decide_for(level, class);
         Ok(PolicyVerdict {
             decision,
             risk_class: class,
-            reason,
+            reason: format!("builtin classifier → {class:?} @ {level:?}"),
             matched_rules: vec![format!("class:{class:?}")],
         })
     }
@@ -199,9 +247,12 @@ fn classify(tokens: &[String]) -> RiskClass {
     if matches!(
         head,
         "apt" | "apt-get" | "yum" | "dnf" | "apk" | "brew" | "pip" | "pip3"
-    ) || (head == "npm" && tokens.get(1).map(|s| s.as_str()) == Some("install"))
-        || (head == "cargo" && tokens.get(1).map(|s| s.as_str()) == Some("install"))
-        || (head == "pip" && tokens.get(1).map(|s| s.as_str()) == Some("install"))
+    ) || (head == "npm"
+        && (tokens.get(1).map(|s| s.as_str()) == Some("install")
+            || tokens.get(1).map(|s| s.as_str()) == Some("i")))
+        || (head == "cargo"
+            && (tokens.get(1).map(|s| s.as_str()) == Some("install")
+                || tokens.get(1).map(|s| s.as_str()) == Some("add")))
     {
         return RiskClass::PackageInstall;
     }
@@ -387,5 +438,73 @@ mod tests {
     fn empty_command_is_fail_closed() {
         let v = verdict("   ");
         assert_eq!(v.decision, PolicyDecision::Ask);
+    }
+
+    #[test]
+    fn l0_is_fully_supervised() {
+        let p = BuiltinPolicyProvider::new();
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L0, "cat x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Ask
+        );
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L0, "rm -rf x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn l2_allows_local_edit_denies_destructive() {
+        let p = BuiltinPolicyProvider::new();
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L2, "cat x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L2, "git push", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Ask
+        );
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L2, "rm -rf x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn l3_allows_git_push_but_asks_install() {
+        let p = BuiltinPolicyProvider::new();
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L3, "git push origin main", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L3, "npm i -g x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Ask
+        );
+    }
+
+    #[test]
+    fn l4_allows_destructive() {
+        let p = BuiltinPolicyProvider::new();
+        assert_eq!(
+            p.evaluate_with(AutonomyLevel::L4, "rm -rf x", "/w")
+                .unwrap()
+                .decision,
+            PolicyDecision::Allow
+        );
     }
 }

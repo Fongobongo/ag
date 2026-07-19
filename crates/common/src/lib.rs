@@ -1,8 +1,8 @@
 pub mod policy;
 pub mod workflow;
 pub use policy::{
-    BuiltinPolicyProvider, CommandPolicyProvider, PolicyDecision, PolicyError, PolicyVerdict,
-    RiskClass,
+    AutonomyLevel, BuiltinPolicyProvider, CommandPolicyProvider, PolicyDecision, PolicyError,
+    PolicyVerdict, RiskClass,
 };
 pub use workflow::{
     CreateWorkflowRequest, CreateWorkflowRunRequest, RoleRunStatus, StepProjection,

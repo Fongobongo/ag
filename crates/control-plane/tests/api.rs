@@ -1373,7 +1373,7 @@ async fn approval_flow_allow_deny_and_expiry() {
     let task_id = create_task(&app, "mock", None).await;
     let ap_id = state
         .store
-        .create_approval(&task_id, "attempt-x", None, "run Bash", 3600)
+        .create_approval(&task_id, "attempt-x", None, "run Bash", 3600, None)
         .await
         .unwrap();
 
@@ -1875,5 +1875,33 @@ async fn policy_endpoint_classifies_commands() {
 
     // Unterminated quote → fail-closed (ask), never allow.
     let v = eval_cmd(&app, "echo \"unterminated").await;
+    assert_eq!(v.get("decision").unwrap(), "ask");
+}
+
+#[tokio::test]
+async fn policy_endpoint_honors_autonomy_level() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+
+    async fn eval(app: &Router, cmd: &str, autonomy: &str) -> serde_json::Value {
+        let body = serde_json::json!({ "command": cmd, "cwd": "/workspace", "autonomy": autonomy })
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/policy/evaluate", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    // L2 (default): git push → ask.
+    let v = eval(&app, "git push origin main", "l2").await;
+    assert_eq!(v.get("decision").unwrap(), "ask");
+    // L3: git push → allow (autonomy permits network/git).
+    let v = eval(&app, "git push origin main", "l3").await;
+    assert_eq!(v.get("decision").unwrap(), "allow");
+    // L0: cat → ask (fully supervised).
+    let v = eval(&app, "cat README.md", "l0").await;
     assert_eq!(v.get("decision").unwrap(), "ask");
 }

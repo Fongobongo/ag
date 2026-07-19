@@ -1436,13 +1436,14 @@ impl Store {
         session_id: Option<&str>,
         permission: &str,
         ttl_secs: i64,
+        step_run_id: Option<&str>,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = now_iso();
         let expires = iso_plus_secs(ttl_secs);
         sqlx::query(
-        "INSERT INTO approvals (id, task_id, attempt_id, session_id, permission, status, created_at, expires_at) \
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+        "INSERT INTO approvals (id, task_id, attempt_id, session_id, permission, status, created_at, expires_at, step_run_id) \
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
     )
     .bind(&id)
     .bind(task_id)
@@ -1451,6 +1452,7 @@ impl Store {
     .bind(permission)
     .bind(&now)
     .bind(&expires)
+    .bind(step_run_id)
     .execute(&self.pool)
     .await?;
         Ok(id)
@@ -1543,26 +1545,55 @@ impl Store {
     }
 
     /// Maintenance tick: flip past-due `pending` approvals to `expired`
-    /// (fail-closed). Returns the number expired.
+    /// (fail-closed). An expired approval that is linked to a workflow step
+    /// blocks that step (and its run) so the run does not hang forever waiting
+    /// on an operator who never answered. Returns the number expired.
     pub async fn tick_approval_expiry(&self) -> Result<usize> {
         let now = now_iso();
-        let rows =
-            sqlx::query("SELECT id FROM approvals WHERE status = 'pending' AND expires_at < ?")
-                .bind(&now)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT id, step_run_id FROM approvals WHERE status = 'pending' AND expires_at < ?",
+        )
+        .bind(&now)
+        .fetch_all(&self.pool)
+        .await?;
         let mut count = 0;
         for r in &rows {
             let id: String = r.try_get("id")?;
+            let step_run_id: Option<String> = r.try_get("step_run_id").ok().flatten();
             if self
                 .answer_approval(&id, ApprovalEvent::Expire, Some("auto-expired"), "system")
                 .await
                 .is_ok()
             {
                 count += 1;
+                if let Some(step) = step_run_id {
+                    let _ = self.block_step_and_run(&step).await;
+                }
             }
         }
         Ok(count)
+    }
+
+    /// Block a workflow step (and its run) because an approval it depended on
+    /// timed out. Only non-terminal steps/runs are touched, so a finished run
+    /// is never reopened. Idempotent.
+    pub async fn block_step_and_run(&self, step_run_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE workflow_steps SET status = 'blocked' \
+             WHERE id = ? AND status NOT IN ('succeeded','failed','blocked','skipped')",
+        )
+        .bind(step_run_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'blocked' \
+             WHERE id = (SELECT run_id FROM workflow_steps WHERE id = ?) \
+             AND status NOT IN ('completed','failed','cancelled','blocked')",
+        )
+        .bind(step_run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -2414,6 +2445,55 @@ mod workflow_tests {
             run_got.status,
             WorkflowRunStatus::Blocked,
             "run must be blocked, not failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_blocks_linked_step() {
+        let s = temp_store().await;
+        let steps = vec![step("a", &[], WorkflowRole::Architect)];
+        let tpl = s.create_workflow_template("ap", &steps).await.unwrap();
+        let run = s
+            .create_workflow_run(&tpl.id, None, Some("demo"), None)
+            .await
+            .unwrap();
+        let poll = agentgrid_common::PollRequest {
+            node_id: "n1".into(),
+            name: "n1".into(),
+            adapters: vec!["mock".into()],
+            repositories: vec!["*".into()],
+            max_concurrency: 2,
+        };
+        s.register_or_touch_node(&poll).await.unwrap();
+        let _ = s.tick_workflow_run(&run.id).await.unwrap();
+        let a1 = s.try_assign("n1").await.unwrap().unwrap();
+        let steps_run = s.get_workflow_run_steps(&run.id).await.unwrap();
+        let step_id = steps_run[0].id.clone();
+        // Approval already expired, linked to the running step.
+        let _ = s
+            .create_approval(
+                &a1.task_id,
+                &a1.attempt_id,
+                None,
+                "run Bash",
+                -10,
+                Some(&step_id),
+            )
+            .await
+            .unwrap();
+        let n = s.tick_approval_expiry().await.unwrap();
+        assert_eq!(n, 1, "one approval should expire");
+        let steps_run = s.get_workflow_run_steps(&run.id).await.unwrap();
+        assert_eq!(
+            steps_run[0].status,
+            WorkflowStepStatus::Blocked,
+            "timed-out approval must block the step, not hang"
+        );
+        let run_got = s.get_workflow_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(
+            run_got.status,
+            WorkflowRunStatus::Blocked,
+            "run must be blocked, not left hanging"
         );
     }
 

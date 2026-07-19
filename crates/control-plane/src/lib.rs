@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agentgrid_common::{
-    ApprovalEvent, ApprovalView, CancelState, CommandPolicyProvider, CompleteAttemptRequest,
-    CreateAgentSessionRequest, CreateRepositoryRequest, CreateTaskRequest, CreateWorkflowRequest,
-    CreateWorkflowRunRequest, EnrollRequest, EnrollResponse, EnrollTokenResponse, EventsQuery,
-    HeartbeatRequest, IngestEventsRequest, LoginRequest, LoginResponse, PollRequest, PollResponse,
-    RepositoryView, SetupRequest, TaskEligibility, TaskView, UploadArtifactRequest,
-    WorkflowProjection, WorkflowRun, WorkflowRunWithSteps, WorkflowTemplate,
+    ApprovalEvent, ApprovalView, CancelState, CompleteAttemptRequest, CreateAgentSessionRequest,
+    CreateRepositoryRequest, CreateTaskRequest, CreateWorkflowRequest, CreateWorkflowRunRequest,
+    EnrollRequest, EnrollResponse, EnrollTokenResponse, EventsQuery, HeartbeatRequest,
+    IngestEventsRequest, LoginRequest, LoginResponse, PollRequest, PollResponse, RepositoryView,
+    SetupRequest, TaskEligibility, TaskView, UploadArtifactRequest, WorkflowProjection,
+    WorkflowRun, WorkflowRunWithSteps, WorkflowTemplate,
 };
 use axum::{
     body::Body,
@@ -447,8 +447,9 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
 async fn evaluate_policy(
     Json(req): Json<EvaluatePolicyRequest>,
 ) -> Json<agentgrid_common::PolicyVerdict> {
+    let level = req.autonomy.unwrap_or_default();
     let verdict = agentgrid_common::BuiltinPolicyProvider::new()
-        .evaluate(&req.command, &req.cwd)
+        .evaluate_with(level, &req.command, &req.cwd)
         .unwrap_or_else(|e| agentgrid_common::PolicyVerdict::fail_closed(&e.0));
     Json(verdict)
 }
@@ -458,6 +459,8 @@ struct EvaluatePolicyRequest {
     command: String,
     #[serde(default)]
     cwd: String,
+    #[serde(default)]
+    autonomy: Option<agentgrid_common::AutonomyLevel>,
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> (StatusCode, axum::response::Response) {
@@ -1155,6 +1158,7 @@ async fn create_approval_for_task_handler(
             body.session_id.as_deref(),
             &perm,
             300,
+            None,
         )
         .await
     {
