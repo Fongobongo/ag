@@ -16,18 +16,20 @@
 
 ---
 
+**Синхронизация (2026-07-17):** Этапы 1–8 реализованы в коде; релизный тег `v0.3.0` (см. CHANGELOG `[Unreleased]`/`[0.3.0]`). Ниже проставлены галочки для выполненных подпунктов. Оставшиеся неотмеченными пункты — документированные follow-up: инфраструктурные (web UI approval/skill-trust, Zeroshot/CTX, изолированные бэкенды, macOS/Windows-агенты, мультихост-E2E в CI, внешний CodeAlive bash-guard) либо частично реализованы. Этап 9 начат (command-policy foundation, 9.1).
+
 ## Этап 1 — 0.1.1 P0 correctness (1 неделя)
 
 ### 1.1 Truthful statuses и outcome model
 
-- [ ] Ввести `AttemptOutcome` (или `effective_status`) отдельно от raw agent exit code
-- [ ] Node: при validation failure передавать в `CompleteAttemptRequest` эффективный результат, а не exit code агента `0`
-- [ ] Control plane: определять success по outcome, а не только по `exit_code == 0`
-- [ ] Regression test: agent exit 0 + validation exit 1 → task `failed`, `error_code=validation_failed`
-- [ ] Разделить error codes: `agent_failed`, `validation_failed`, `timeout`, `cancelled`, `node_lost`, `infrastructure_failed`
-- [ ] Timeout: передавать `error_code=timeout` (сейчас неотличим от общего падения)
-- [ ] Test: timeout не может быть зарепорчен как generic agent failure
-- [ ] Cancel: подтверждённая отмена всегда даёт `cancelled` независимо от exit code (проверить существующее поведение тестом)
+- [x] Ввести `AttemptOutcome` (или `effective_status`) отдельно от raw agent exit code
+- [x] Node: при validation failure передавать в `CompleteAttemptRequest` эффективный результат, а не exit code агента `0`
+- [x] Control plane: определять success по outcome, а не только по `exit_code == 0`
+- [x] Regression test: agent exit 0 + validation exit 1 → task `failed`, `error_code=validation_failed`
+- [x] Разделить error codes: `agent_failed`, `validation_failed`, `timeout`, `cancelled`, `node_lost`, `infrastructure_failed`
+- [x] Timeout: передавать `error_code=timeout` (сейчас неотличим от общего падения)
+- [x] Test: timeout не может быть зарепорчен как generic agent failure
+- [x] Cancel: подтверждённая отмена всегда даёт `cancelled` независимо от exit code (проверить существующее поведение тестом)
 
 ### 1.2 Lost attempts и node recovery
 
@@ -39,18 +41,18 @@
 
 ### 1.3 Explicit assignment acknowledgement
 
-- [ ] Добавить `POST /v1/node/attempts/{id}/ack` (или поле в первом event batch) вместо synthetic `attempt started` metric event
-- [ ] Ввести отдельный `ack_deadline`: ack атомарно переводит `assigned → running`; после ack lease продлевается heartbeat/renewal, а не наличием output events
-- [ ] Убрать зависимость lease от side effect ingest; все ack/renew операции идемпотентны
-- [ ] Совместимость: control plane принимает старое поведение N-1 node (metric event как ack) только на период одного minor-релиза
-- [ ] Tests: node не ackнула до deadline → assignment возвращён; медленный агент (> 30s до первого output) после ack не теряет assignment
+- [x] Добавить `POST /v1/node/attempts/{id}/ack` (или поле в первом event batch) вместо synthetic `attempt started` metric event
+- [x] Ввести отдельный `ack_deadline`: ack атомарно переводит `assigned → running`; после ack lease продлевается heartbeat/renewal, а не наличием output events
+- [x] Убрать зависимость lease от side effect ingest; все ack/renew операции идемпотентны
+- [x] Совместимость: control plane принимает старое поведение N-1 node (metric event как ack) только на период одного minor-релиза
+- [x] Tests: node не ackнула до deadline → assignment возвращён; медленный агент (> 30s до первого output) после ack не теряет assignment
 
 ### 1.4 Scheduler: head-of-line blocking
 
-- [ ] `try_assign`: искать самый старый **eligible** для данной node task, а не первый queued
-- [ ] Сохранить fairness: сортировка по `created_at`, tie-break по последнему назначению
-- [ ] Test: несовместимый первый task (другой adapter) не блокирует следующий подходящий
-- [ ] Test: `requested_node_id` по-прежнему уважается
+- [x] `try_assign`: искать самый старый **eligible** для данной node task, а не первый queued
+- [x] Сохранить fairness: сортировка по `created_at`, tie-break по последнему назначению
+- [x] Test: несовместимый первый task (другой adapter) не блокирует следующий подходящий
+- [x] Test: `requested_node_id` по-прежнему уважается
 - [ ] Метрика scheduler latency (queued → assigned)
 
 **Exit 1:** статусы задач всегда правдивы; потеря node не подвешивает задачи; очередь не блокируется несовместимой головой.
@@ -64,56 +66,56 @@
 - [ ] Встроенный SQLite spool на node: таблицы `outbox_events`, `outbox_completions`, `outbox_artifacts`; крупные artifact payload хранить файлами content-addressed, а не BLOB в SQLite
 - [ ] `EventSink`: писать batch в spool до попытки отправки; удалять только после HTTP 2xx и подтверждённого server-side sequence/idempotency key
 - [ ] Приоритет доставки: completion/state > permission/terminal events > ordinary logs > artifacts; логи не могут вытеснить terminal state
-- [ ] Проверять HTTP status всех node→CP запросов (сейчас проверяется только transport error)
-- [ ] Retry с exponential backoff + jitter; резюме по sequence
+- [x] Проверять HTTP status всех node→CP запросов (сейчас проверяется только transport error)
+- [x] Retry с exponential backoff + jitter; резюме по sequence
 - [ ] Ограничения: RAM buffer 1–4 МБ; лимиты spool задаются per attempt и per node; backpressure + truncation с меткой `output_truncated` (status/error/result/approval не удалять)
-- [ ] `CompleteAttemptRequest`: durable retry + idempotency (повторный complete того же attempt — no-op)
-- [ ] Artifact upload: retry, проверка response status, идемпотентность per name
+- [x] `CompleteAttemptRequest`: durable retry + idempotency (повторный complete того же attempt — no-op)
+- [x] Artifact upload: retry, проверка response status, идемпотентность per name
 - [ ] Recovery: после рестарта daemon обнаружить незавершённые attempts и непустой outbox → досылка/reconciliation с control plane
 - [ ] E2E: `docker network disconnect` в середине задачи → события доехали без дублей и пропусков
 - [ ] E2E: kill -9 daemon → после рестарта outbox досылается, attempt корректно завершается или репортится
 
 ### 2.2 Secrets и artifact safety
 
-- [ ] Fallback-ветка `read_stream`: отправлять `masked`, а не исходный `line` (сейчас утечка)
-- [ ] Masking для validation stream и `validation.log`
-- [ ] Test: секрет из `AGENTGRID_SECRETS` не появляется в events, artifacts, validation.log, changes.patch
+- [x] Fallback-ветка `read_stream`: отправлять `masked`, а не исходный `line` (сейчас утечка)
+- [x] Masking для validation stream и `validation.log`
+- [x] Test: секрет из `AGENTGRID_SECRETS` не появляется в events, artifacts, validation.log, changes.patch
 - [ ] Вынести `agent-raw-output.log` из worktree (в attempt dir вне git) либо добавить в `.git/info/exclude`
 - [ ] Test: `agent-raw-output.log` и `validation.log` отсутствуют в commit и patch
 - [ ] Валидация artifact name: safe basename, запрет `..` и absolute paths; запись через descriptor-relative API (`openat`/`cap-std`, `O_NOFOLLOW`) вместо одной лишь canonicalize-проверки
 - [ ] Adversarial tests: `../x`, `/etc/passwd`, symlink в worktree, symlink-swap/TOCTOU
-- [ ] Credential file: atomic create + rename, mode `0600`
+- [x] Credential file: atomic create + rename, mode `0600`
 - [ ] Binary-safe artifact API: streaming upload/download, hash + size + media type (замена UTF-8 JSON body)
 
 ### 2.3 Git isolation и injection
 
-- [ ] Убрать все `sh -c` из `git.rs` и `probe_adapter`; каждый арг��мент через `Command::arg`
-- [ ] Строгие типы/валидация: repository slug, branch/ref, adapter id (`[a-z0-9-_]`, длина)
-- [ ] Adversarial tests: пробелы, кавычки, `;`, `$()`, `..` в git_url/repo name/branch
+- [x] Убрать все `sh -c` из `git.rs` и `probe_adapter`; каждый арг��мент через `Command::arg`
+- [x] Строгие типы/валидация: repository slug, branch/ref, adapter id (`[a-z0-9-_]`, длина)
+- [x] Adversarial tests: пробелы, кавычки, `;`, `$()`, `..` в git_url/repo name/branch
 - [ ] Per-repository async lock + file lock: fetch, checkout, `worktree add`, cleanup сериализованы
 - [ ] Test: два параллельных attempts одного repo не ломают clone state
 - [ ] Убрать `checkout -B` в shared clone → bare mirror либо detached ref; worktree от зафиксированного commit
-- [ ] Добавить `base_commit` в `Assignment`; фиксировать его при fetch
+- [x] Добавить `base_commit` в `Assignment`; фиксировать его при fetch
 - [ ] Worktree/branch cleanup: retention 24h, фоновая job, `git worktree prune`, reconciliation при старте
 - [ ] Artifacts retention на control plane (168h default) + фоновая очистка
 
 ### 2.4 Adapter registry
 
-- [ ] Реестр `adapter_id → {command, args, env, version_probe}` (TOML/env) вместо одного `AGENTGRID_ADAPTER`
-- [ ] Запускать adapter строго по `assignment.adapter`; неизвестный adapter → отказ attempt с `infrastructure_failed`
-- [ ] Heartbeat публикует только реально probed/ready adapters (не заявленный CSV-список)
-- [ ] Кэшировать capability probe; обновлять при старте, периодически и после `command not found`
-- [ ] Поля readiness: `ready | missing | incompatible | misconfigured` + версия
-- [ ] Test: task с adapter B на node с A и B запускает именно B
-- [ ] Test: node без claude не рекламирует claude
+- [x] Реестр `adapter_id → {command, args, env, version_probe}` (TOML/env) вместо одного `AGENTGRID_ADAPTER`
+- [x] Запускать adapter строго по `assignment.adapter`; неизвестный adapter → отказ attempt с `infrastructure_failed`
+- [x] Heartbeat публикует только реально probed/ready adapters (не заявленный CSV-список)
+- [x] Кэшировать capability probe; обновлять при старте, периодически и после `command not found`
+- [x] Поля readiness: `ready | missing | incompatible | misconfigured` + версия
+- [x] Test: task с adapter B на node с A и B запускает именно B
+- [x] Test: node без claude не рекламирует claude
 
 ### 2.5 Operational hardening
 
-- [ ] SQLite `PRAGMA quick_check` при старте control plane
+- [x] SQLite `PRAGMA quick_check` при старте control plane
 - [ ] WAL checkpoint при graceful shutdown; периодический `TRUNCATE` checkpoint
 - [ ] Backup команда (`VACUUM INTO` / backup API) + тест восстановления
 - [ ] Foreign keys для новых таблиц; план миграции legacy schema
-- [ ] Требовать стабильный `AGENTGRID_JWT_SECRET` (fail или явный warning при random-per-start)
+- [x] Требовать стабильный `AGENTGRID_JWT_SECRET` (fail или явный warning при random-per-start)
 - [ ] Rate limit на `/v1/auth/login`; lockout/backoff и audit не должны позволять user enumeration
 - [ ] Web auth: уйти от JWT в `localStorage` к HttpOnly + Secure + SameSite cookie (либо memory token для non-browser clients); добавить CSRF-защиту для cookie flow
 - [ ] Transport security для разных ПК: TLS обязателен вне loopback; documented reverse-proxy mode на 0.1.1, roadmap native TLS/mTLS; enrollment tokens одноразовые и с TTL
@@ -129,10 +131,10 @@
 
 ### 3.1 Versioned event envelope
 
-- [ ] Ввести `AgentEventEnvelope { version, kind, payload, raw_ref }` поверх текущего `TaskEvent`
-- [ ] Сохранить decode legacy NDJSON без миграции старых записей
-- [ ] Добавить kinds: `plan`, `tool_call`, `tool_result`, `file_change`, `permission_request`, `usage`, `handoff`
-- [ ] Serde round-trip tests для всех kinds; unknown kind → raw log, не ошибка
+- [x] Ввести `AgentEventEnvelope { version, kind, payload, raw_ref }` поверх текущего `TaskEvent`
+- [x] Сохранить decode legacy NDJSON без миграции старых записей
+- [x] Добавить kinds: `plan`, `tool_call`, `tool_result`, `file_change`, `permission_request`, `usage`, `handoff`
+- [x] Serde round-trip tests для всех kinds; unknown kind → raw log, не ошибка
 
 ### 3.2 AgentAdapter / ExecutionBackend разделение
 
@@ -196,16 +198,16 @@
 
 ## Этап 6 — 0.2 ACP northbound gateway (1–2 недели)
 
-- [ ] `agentgrid acp-agent` (stdio): Agentgrid как ACP agent для внешних клиентов
-- [ ] Mapping ACP session → Agentgrid task/workflow; `_meta.agentgrid.dev` для расширений
-- [ ] Streaming task events → `session/update` (plan projection, tool calls, diffs, terminal)
-- [ ] Approval requests сквозно: node → control plane → ACP client → обратно
-- [ ] В 0.2 поддержать только честные режимы `ask`/`worker`; `architect`/`verifier`/`orchestrator` рекламировать лишь после появления Workflow engine в 0.3
-- [ ] Cancellation: `session/cancel` останавливает связанную task/turn
-- [ ] Extension methods с префиксом `_` для node list/eligibility
-- [ ] Spike: подключить Poracode/Lightcode; задокументировать совместимость и gaps
-- [ ] Smoke test со вторым ACP client
-- [ ] Выпустить тег `v0.2.0`
+- [x] `agentgrid acp-agent` (stdio): Agentgrid как ACP agent для внешних клиентов
+- [x] Mapping ACP session → Agentgrid task/workflow; `_meta.agentgrid.dev` для расширений
+- [x] Streaming task events → `session/update` (plan projection, tool calls, diffs, terminal)
+- [x] Approval requests сквозно: node → control plane → ACP client → обратно
+- [x] В 0.2 поддержать только честные режимы `ask`/`worker`; `architect`/`verifier`/`orchestrator` рекламировать лишь после появления Workflow engine в 0.3
+- [x] Cancellation: `session/cancel` останавливает связанную task/turn
+- [x] Extension methods с префиксом `_` для node list/eligibility
+- [x] Spike: подключить Poracode/Lightcode; задокументировать совместимость и gaps
+- [x] Smoke test со вторым ACP client
+- [x] Выпустить тег `v0.2.0`
 
 **Exit 6 (релиз 0.2):** задача создаётся из внешнего ACP клиента, выполняется на удалённой node, клиент видит plan/progress/diff и отвечает на permission requests.
 
@@ -215,18 +217,18 @@
 
 ### 7.1 Модель данных
 
-- [ ] Таблицы: `workflow_templates`, `workflow_runs`, `workflow_steps`, `role_runs`, `agent_messages`, `handoff_packages` (FK, индексы)
-- [ ] Legacy attempts: `workflow_step_id = NULL` — обычные задачи работают как раньше
+- [x] Таблицы: `workflow_templates`, `workflow_runs`, `workflow_steps`, `role_runs`, `agent_messages`, `handoff_packages` (FK, индексы)
+- [x] Legacy attempts: `workflow_step_id = NULL` — обычные задачи работают как раньше
 - [ ] YAML парсер `WorkflowTemplate`: roles, steps, depends_on, placement, budgets, validation
-- [ ] DAG validation: циклы, недостижимые steps, неизвестные роли → ошибка до запуска
-- [ ] State machines: step (`pending → ready → running → succeeded/failed/blocked/skipped`), run (`created → running → paused → completed/failed/cancelled`)
+- [x] DAG validation: циклы, недостижимые steps, неизвестные роли → ошибка до запуска
+- [x] State machines: step (`pending → ready → running → succeeded/failed/blocked/skipped`), run (`created → running → paused → completed/failed/cancelled`)
 
 ### 7.2 Исполнение
 
-- [ ] Durable scheduler: ready steps → существующий assignment/attempt mechanism; reconciliation после рестарта control plane; идемпотентная активация step
-- [ ] Retry policy per step: maxAttempts/backoff/retryable error codes; side-effectful steps по умолчанию не retry
+- [x] Durable scheduler: ready steps → существующий assignment/attempt mechanism; reconciliation после рестарта control plane; идемпотентная активация step
+- [x] Retry policy per step: maxAttempts/backoff/retryable error codes; side-effectful steps по умолчанию не retry
 - [ ] Параллельные ready steps в разных worktrees (опирается на per-repo lock из Этапа 2)
-- [ ] Roles: architect, worker, verifier, reviewer, integrator — как параметризация prompt/context/adapter
+- [x] Roles: architect, worker, verifier, reviewer, integrator — как параметризация prompt/context/adapter
 - [ ] Architect возвращает machine-readable plan (JSON/YAML) → генерация steps
 - [ ] Human approval плана до активации DAG (CLI/UI/ACP)
 - [ ] Typed `AgentMessage` mailbox: orchestrator-mediated, без free-form P2P
@@ -237,7 +239,7 @@
 - [ ] Repair rounds: ограниченное число; после лимита — эскалация человеку
 - [ ] Pause/resume/cancel всего run и отдельных steps
 - [ ] UI/CLI: workflow graph, step timeline, сообщения, verdicts
-- [ ] Golden workflow test: architect → 2 параллельных worker → integrator → validation → verifier на mock adapters (детерминированно)
+- [x] Golden workflow test: architect → 2 параллельных worker → integrator → validation → verifier на mock adapters (детерминированно)
 
 **Exit 7:** сценарий architect → parallel workers → integrator → verifier проходит локально на одной машине; бесконечные циклы невозможны по бюджетам.
 
