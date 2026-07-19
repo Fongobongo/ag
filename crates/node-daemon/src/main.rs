@@ -29,6 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 mod git;
+mod sandbox;
 
 #[derive(Clone)]
 struct Config {
@@ -47,6 +48,8 @@ struct Config {
     secrets: Vec<String>,
     /// Extra env vars forwarded to the adapter subprocess (e.g. API keys).
     adapter_env: Vec<(String, String)>,
+    /// Agent isolation: wrap the spawned agent in a container (idea 5).
+    sandbox: sandbox::SandboxKind,
 }
 
 /// Node identity persisted to disk after enrollment (never re-sent in plaintext).
@@ -151,6 +154,7 @@ fn config_from_env() -> Config {
         ),
         secrets: split_csv("AGENTGRID_SECRETS", ""),
         adapter_env: parse_env_pairs("AGENTGRID_ADAPTER_ENV"),
+        sandbox: sandbox::SandboxKind::from_env(),
     }
 }
 
@@ -425,26 +429,22 @@ async fn drive_acp_session(
 ) -> Result<AcpResult> {
     // Native ACP launcher (direct CLI, e.g. `claude --acp`) takes priority
     // over the `adapter-<id>` wrapper binary.
-    let mut cmd = match resolve_acp_launch(&assignment.adapter) {
-        Some((program, args)) => {
-            let mut c = tokio::process::Command::new(&program);
-            c.args(&args);
-            c
-        }
-        None => {
-            let bin = match resolve_adapter_bin(&assignment.adapter) {
-                Some(b) => b,
-                None => {
-                    tracing::error!(adapter = %assignment.adapter, "ACP adapter binary not found");
-                    return Ok(AcpResult {
-                        success: false,
-                        error_code: Some("infrastructure_failed".into()),
-                    });
-                }
-            };
-            tokio::process::Command::new(&bin)
-        }
+    let (program, args) = match resolve_acp_launch(&assignment.adapter) {
+        Some((program, args)) => (program, args),
+        None => match resolve_adapter_bin(&assignment.adapter) {
+            Some(b) => (b, vec![]),
+            None => {
+                tracing::error!(adapter = %assignment.adapter, "ACP adapter binary not found");
+                return Ok(AcpResult {
+                    success: false,
+                    error_code: Some("infrastructure_failed".into()),
+                });
+            }
+        },
     };
+    let (program, args) = sandbox::sandbox_command(cfg.sandbox, &program, &args, ws_path);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -706,6 +706,9 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         }
     };
     // Stage 3.2: spawn through the ExecutionBackend contract (native process).
+    // ponytail: sandbox not applied here (legacy wrapper path); the ACP path
+    // is sandboxed. Wire Sandbox into ExecutionBackend if legacy isolation is
+    // needed.
     let req = agentgrid_adapters::SpawnRequest {
         bin,
         prompt: assignment.prompt.clone(),
@@ -1493,6 +1496,7 @@ mod tests {
             credential_path: std::env::temp_dir().join("ag-acp-cred.json"),
             repository_root: std::env::temp_dir().join("ag-acp-repos"),
             secrets: vec![],
+            sandbox: sandbox::SandboxKind::None,
             adapter_env: vec![],
         };
         let ws = std::env::temp_dir().join(format!(
