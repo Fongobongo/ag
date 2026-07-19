@@ -54,6 +54,8 @@ pub struct AppState {
     limits: Limits,
     /// Database file path (for SQLite size metrics, Stage 5.2).
     db_path: String,
+    /// Brute-force protection on `/v1/auth/login` (Stage 2.5).
+    login_rate: Arc<tokio::sync::Mutex<LoginRate>>,
 }
 
 /// Request size ceilings (Stage 5.1). Overridable via env; defaults:
@@ -62,6 +64,37 @@ struct Limits {
     prompt: usize,
     event: usize,
     artifact: usize,
+}
+
+/// Sliding-window brute-force limiter for the login endpoint (Stage 2.5).
+/// Keyed globally per control-plane instance; a generic 429 (not a per-user
+/// signal) is returned when the budget is spent, so it cannot be used to
+/// enumerate which usernames exist.
+struct LoginRate {
+    window_start: i64,
+    count: u32,
+    max: u32,
+    window_secs: i64,
+}
+
+impl LoginRate {
+    fn new() -> Self {
+        Self {
+            window_start: 0,
+            count: 0,
+            max: 10,
+            window_secs: 60,
+        }
+    }
+    /// Record an attempt; returns false once the per-window budget is spent.
+    fn check_and_record(&mut self, now: i64) -> bool {
+        if now - self.window_start >= self.window_secs {
+            self.window_start = now;
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count <= self.max
+    }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -132,6 +165,7 @@ impl AppState {
             web_root,
             limits,
             db_path: db_path.to_string(),
+            login_rate: Arc::new(tokio::sync::Mutex::new(LoginRate::new())),
         }))
     }
 
@@ -190,6 +224,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/auth/setup", post(auth_setup))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/policy/evaluate", post(evaluate_policy))
+        .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
         .route("/v1/nodes/{id}", delete(revoke_node))
@@ -406,6 +441,18 @@ async fn auth_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
+    // Stage 2.5: brute-force protection. Fail closed to 429 on budget
+    // exhaustion; the generic error avoids user enumeration.
+    {
+        let mut rate = state.login_rate.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if !rate.check_and_record(now) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
     let user = state
         .store
         .verify_user(&req.username, &req.password)
@@ -442,7 +489,25 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
     }
 }
 
-/// Stage 9: evaluate a command against the builtin policy provider and return
+/// Stage 2.5: compact-copy the database to `path` via `VACUUM INTO`.
+/// User-authenticated (the global user-auth middleware covers it).
+async fn admin_backup(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BackupRequest>,
+) -> StatusCode {
+    match state.store.backup_to(&req.path).await {
+        Ok(()) => StatusCode::OK,
+        Err(e) => {
+            tracing::error!("backup failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BackupRequest {
+    path: String,
+}
 /// its verdict. Fail-closed: a provider error yields `ask`, never `allow`.
 async fn evaluate_policy(
     State(state): State<Arc<AppState>>,
@@ -936,6 +1001,11 @@ async fn upload_artifact(
     if req.content.len() > state.limits.artifact {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
+    // Stage 2.2: never let a crafted name escape the artifact root
+    // (../../etc/passwd, absolute paths, separators).
+    if !is_safe_artifact_name(&req.name) {
+        return StatusCode::BAD_REQUEST;
+    }
     match state.store.save_artifact(&attempt_id, &req).await {
         Ok(()) => StatusCode::OK,
         Err(e) => {
@@ -943,6 +1013,21 @@ async fn upload_artifact(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+/// A safe artifact name is a single path segment: no separators, no `.`
+/// traversal, no NUL, bounded length (Stage 2.2).
+fn is_safe_artifact_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    if name == "." || name == ".." || name.starts_with("../") || name.starts_with("..\\") {
+        return false;
+    }
+    name.chars().all(|c| !c.is_control())
 }
 
 async fn events_stream(
@@ -1305,6 +1390,32 @@ pub async fn serve(state: Arc<AppState>, addr: std::net::SocketAddr) -> anyhow::
     state.store.start_maintenance();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("control plane listening on {addr}");
-    axum::serve(listener, build_router(state)).await?;
+    axum::serve(listener, build_router(state.clone()))
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
+        .await?;
     Ok(())
+}
+
+/// Await Ctrl-C / SIGTERM, then truncate the WAL so a restart replays nothing
+/// stale (Stage 2.5 ops).
+async fn shutdown_signal(state: Arc<AppState>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                let _ = sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    let _ = state.store.wal_checkpoint().await;
 }

@@ -29,6 +29,7 @@ const ASSIGNMENT_LEASE_SECS: i64 = 30;
 /// unacked assignment is reverted (returned to the queue) once this passes.
 const ACK_DEADLINE_SECS: i64 = 30;
 
+#[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
     artifact_root: std::path::PathBuf,
@@ -1243,6 +1244,10 @@ impl Store {
         let now = now_iso();
         revert_expired_leases(&self.pool, &now).await?;
         mark_offline_nodes(&self.pool, &now).await?;
+        // Housekeeping: drop expired artifacts and truncate the WAL so the
+        // database file does not grow without bound.
+        let _ = self.cleanup_artifacts(168).await;
+        let _ = self.wal_checkpoint().await;
         Ok(())
     }
 
@@ -1258,19 +1263,52 @@ impl Store {
     }
 
     pub fn start_maintenance(&self) {
-        let pool = self.pool.clone();
+        let store = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let now = now_iso();
-                if let Err(e) = revert_expired_leases(&pool, &now).await {
+                if let Err(e) = revert_expired_leases(&store.pool, &now).await {
                     tracing::warn!("lease maintenance failed: {e}");
                 }
-                if let Err(e) = mark_offline_nodes(&pool, &now).await {
+                if let Err(e) = mark_offline_nodes(&store.pool, &now).await {
                     tracing::warn!("node maintenance failed: {e}");
                 }
+                let _ = store.cleanup_artifacts(168).await;
+                let _ = store.wal_checkpoint().await;
             }
         });
+    }
+
+    /// Truncate the WAL into the main database (Stage 2.5 ops).
+    pub async fn wal_checkpoint(&self) -> Result<()> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Compact copy of the database for backup/restore rehearsal (Stage 2.5 ops).
+    /// The path is validated to avoid shell/SQL injection; `VACUUM INTO` refuses
+    /// to overwrite an existing file.
+    pub async fn backup_to(&self, path: &str) -> Result<()> {
+        if path.contains('\\') || path.contains(';') || path.contains('\0') || path.contains("..") {
+            return Err(anyhow::anyhow!("invalid backup path: {path}"));
+        }
+        let stmt = format!("VACUUM INTO '{}'", path.replace('\'', "''"));
+        sqlx::query(&stmt).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Delete artifact metadata older than `retention_hours` (default 168).
+    /// Files on disk are left for an operator cleanup job (metadata only here).
+    pub async fn cleanup_artifacts(&self, retention_hours: i64) -> Result<u64> {
+        let cutoff = iso_plus_secs(-(retention_hours * 3600));
+        let res = sqlx::query("DELETE FROM artifacts WHERE stored_at < ?")
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 }
 
@@ -2640,5 +2678,59 @@ mod workflow_tests {
         assert_eq!(work.role, WorkflowRole::Worker);
         assert!(work.task_id.is_some(), "worker task should be spawned");
         assert_eq!(work.node_id, None, "worker not assigned yet");
+    }
+
+    #[tokio::test]
+    async fn backup_round_trips() {
+        let s = temp_store().await;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backup = std::env::temp_dir().join(format!("ag-backup-{stamp}.db"));
+        if backup.exists() {
+            let _ = std::fs::remove_file(&backup);
+        }
+        s.backup_to(backup.to_str().unwrap()).await.unwrap();
+        assert!(backup.exists(), "VACUUM INTO must create the backup file");
+        // Re-opening the backup must succeed and yield a usable store.
+        let reopened = Store::open(backup.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.user_count().await.unwrap(), 0);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_artifacts() {
+        let s = temp_store().await;
+        sqlx::query(
+            "INSERT INTO artifacts (id, attempt_id, name, size_bytes, stored_at) VALUES (?,?,?,?,?)",
+        )
+        .bind("a-new")
+        .bind("att-1")
+        .bind("new.txt")
+        .bind(3)
+        .bind(now_iso())
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let old = iso_plus_secs(-(200 * 3600));
+        sqlx::query(
+            "INSERT INTO artifacts (id, attempt_id, name, size_bytes, stored_at) VALUES (?,?,?,?,?)",
+        )
+        .bind("a-old")
+        .bind("att-1")
+        .bind("old.txt")
+        .bind(3)
+        .bind(&old)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let removed = s.cleanup_artifacts(168).await.unwrap();
+        assert_eq!(removed, 1, "only the 200h-old artifact should be reaped");
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 }

@@ -1999,3 +1999,88 @@ async fn approval_payload_has_no_secrets() {
         );
     }
 }
+
+async fn login_status(app: &Router, user: &str, pass: &str) -> StatusCode {
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/login",
+            serde_json::to_string(&json!({ "username": user, "password": pass })).unwrap(),
+            None,
+        ))
+        .await
+        .unwrap();
+    resp.status()
+}
+
+#[tokio::test]
+async fn login_rate_limit_returns_429() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    // Window budget is 10 per 60s; the 11th attempt is throttled. Failed
+    // logins (no such user) still count, so brute-force is bounded.
+    for i in 0..10 {
+        let code = login_status(&app, "nobody", &format!("wrong{i}")).await;
+        assert_ne!(
+            code,
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt {i} must not throttle"
+        );
+    }
+    let code = login_status(&app, "nobody", "wrong-extra").await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn artifact_name_validation_rejects_traversal() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let (_, cred) = enroll(&app, "node-a", vec![], vec![]).await;
+    let uri = "/v1/node/attempts/att-1/artifacts";
+    let bad = UploadArtifactRequest {
+        name: "../../etc/passwd".into(),
+        content: "x".into(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(post_auth(uri, serde_json::to_string(&bad).unwrap(), &cred))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let ok = UploadArtifactRequest {
+        name: "out.txt".into(),
+        content: "x".into(),
+    };
+    let resp2 = app
+        .clone()
+        .oneshot(post_auth(uri, serde_json::to_string(&ok).unwrap(), &cred))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp2.status(),
+        StatusCode::BAD_REQUEST,
+        "safe name must pass validation"
+    );
+}
+
+#[tokio::test]
+async fn backup_endpoint_writes_file() {
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+    let path = std::env::temp_dir().join(format!("ag-admin-backup-{}.db", std::process::id()));
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/admin/backup",
+            serde_json::to_string(&json!({ "path": path.to_str().unwrap() })).unwrap(),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(path.exists(), "backup file must be created");
+    let _ = std::fs::remove_file(&path);
+}

@@ -97,7 +97,7 @@
 - [ ] Убрать `checkout -B` в shared clone → bare mirror либо detached ref; worktree от зафиксированного commit
 - [x] Добавить `base_commit` в `Assignment`; фиксировать его при fetch
 - [ ] Worktree/branch cleanup: retention 24h, фоновая job, `git worktree prune`, reconciliation при старте
-- [ ] Artifacts retention на control plane (168h default) + фоновая очистка
+- [x] Artifacts retention на control plane (168h default) + фоновая очистка
 
 ### 2.4 Adapter registry
 
@@ -112,11 +112,11 @@
 ### 2.5 Operational hardening
 
 - [x] SQLite `PRAGMA quick_check` при старте control plane
-- [ ] WAL checkpoint при graceful shutdown; периодический `TRUNCATE` checkpoint
-- [ ] Backup команда (`VACUUM INTO` / backup API) + тест восстановления
+- [x] WAL checkpoint при graceful shutdown; периодический `TRUNCATE` checkpoint
+- [x] Backup команда (`VACUUM INTO` / backup API) + тест восстановления
 - [ ] Foreign keys для новых таблиц; план миграции legacy schema
 - [x] Требовать стабильный `AGENTGRID_JWT_SECRET` (fail или явный warning при random-per-start)
-- [ ] Rate limit на `/v1/auth/login`; lockout/backoff и audit не должны позволять user enumeration
+- [x] Rate limit на `/v1/auth/login`; lockout/backoff и audit не должны позволять user enumeration
 - [ ] Web auth: уйти от JWT в `localStorage` к HttpOnly + Secure + SameSite cookie (либо memory token для non-browser clients); добавить CSRF-защиту для cookie flow
 - [ ] Transport security для разных ПК: TLS обязателен вне loopback; documented reverse-proxy mode на 0.1.1, roadmap native TLS/mTLS; enrollment tokens одноразовые и с TTL
 - [ ] Protocol versioning: `protocol_version` в enroll/heartbeat/poll; N/N-1 совместимость; несовместимая node → `degraded(incompatible_protocol)`
@@ -429,7 +429,7 @@
 - [ ] `kill -9` node-daemon посреди attempt → после рестарта нет потерянных completions, нет зависших `running`
 - [ ] Секрет в stdout/stderr/validation output → замаскирован во всех путях, включая fallback и artifacts
 - [ ] `agent-raw-output.log` не попадает в git-коммит и в patch
-- [ ] Artifact name `../../etc/passwd` → отклонён, запись только внутри artifact root
+- [x] Artifact name `../../etc/passwd` → отклонён, запись только внутри artifact root
 - [ ] Repo slug/branch/URL с shell-метасимволами → нет выполнения произвольных команд
 - [ ] Task для adapter B на node с default A → запускается именно B или честный reject
 - [ ] Два параллельных attempt одного репо → оба завершаются корректно без гонок Git
