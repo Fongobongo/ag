@@ -7,19 +7,75 @@
 //! easy open bot API (Business API is heavy and gated), so it is honestly
 //! deferred rather than faked.
 //!
-//! Auth: a comma-separated allowlist of chat ids in `AGENTGRID_GATEWAY_ADMINS`.
-//! Any chat not on the list is ignored.
+//! Auth: `/start` and `/whoami` are open to anyone (they just echo your chat
+//! id and tell you the host-side command to confirm ownership). Every other
+//! command requires your chat id to be in the allowlist — a per-line file
+//! (`AGENTGRID_GATEWAY_ADMINS_FILE`, default `~/.config/agentgrid/gateway-admins.txt`)
+//! or comma-list `AGENTGRID_GATEWAY_ADMINS`. An operator with shell access to
+//! the host running the gateway runs `agentgrid-gateway allow <chat_id>` to add
+//! a chat. The file is re-read on every message, so approval takes effect
+//! immediately without restarting the bot.
 //!
 //! Commands: /help /nodes /tasks /run <repo> <adapter> <prompt...>
-//!           /show <id> /cancel <id> /logs <id>
+//!           /show <id> /cancel <id> /logs <id> /whoami
 
 use std::time::Duration;
 
 use agentgrid_common::CreateTaskRequest;
 use anyhow::Result;
 
+/// Where the persisted allowlist of admin chat ids lives. `allow` writes here,
+/// `run` reads it on every message (cheap — tiny file). Override with env.
+fn admins_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("AGENTGRID_GATEWAY_ADMINS_FILE") {
+        return std::path::PathBuf::from(p);
+    }
+    let mut p = config_dir();
+    p.push("agentgrid");
+    let _ = std::fs::create_dir_all(&p);
+    p.push("gateway-admins.txt");
+    p
+}
+
+fn config_dir() -> std::path::PathBuf {
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        return d;
+    }
+    if let Some(h) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")) {
+        return h;
+    }
+    std::path::PathBuf::from(".")
+}
+
+/// Load the allowlist: the persisted file (one id per line) plus any
+/// comma-separated ids in `AGENTGRID_GATEWAY_ADMINS` (bootstrap/override).
+fn load_admins() -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    if let Ok(s) = std::env::var("AGENTGRID_GATEWAY_ADMINS") {
+        out.extend(s.split(',').filter_map(|x| x.trim().parse::<i64>().ok()));
+    }
+    if let Ok(s) = std::fs::read_to_string(admins_file()) {
+        out.extend(s.lines().filter_map(|x| x.trim().parse::<i64>().ok()));
+    }
+    out
+}
+
 #[derive(clap::Parser)]
-struct Args {
+#[command(name = "agentgrid-gateway")]
+enum Args {
+    /// Run the chat bridge (Telegram long-poll loop).
+    Run(RunArgs),
+    /// Approve a Telegram chat id on this host so it can drive the gateway.
+    /// The chat learns its id from `/start` / `/whoami`, then an operator with
+    /// shell access to this host runs this command to confirm ownership.
+    Allow(AllowArgs),
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
     /// Control-plane base URL, e.g. http://127.0.0.1:7800
     #[arg(long, env = "AGENTGRID_SERVER")]
     control_plane: String,
@@ -29,10 +85,12 @@ struct Args {
     /// Telegram bot token from @BotFather. Omit to disable Telegram.
     #[arg(long, env = "AGENTGRID_GATEWAY_TELEGRAM_TOKEN")]
     telegram: Option<String>,
-    /// Comma-separated allowlist of numeric chat ids allowed to talk to the
-    /// gateway. Any other chat is ignored.
-    #[arg(long, env = "AGENTGRID_GATEWAY_ADMINS")]
-    admins: String,
+}
+
+#[derive(clap::Args)]
+struct AllowArgs {
+    /// The numeric Telegram chat id to approve.
+    chat_id: i64,
 }
 
 #[tokio::main]
@@ -43,15 +101,30 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "agentgrid_gateway=info".into()),
         )
         .init();
-    let args: Args = clap::Parser::parse();
-    let admins: Vec<i64> = args
-        .admins
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    if admins.is_empty() {
-        anyhow::bail!("no admin chat ids in --admins");
+    match clap::Parser::parse() {
+        Args::Run(a) => run(a).await,
+        Args::Allow(a) => {
+            let path = admins_file();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut s = std::fs::read_to_string(&path).unwrap_or_default();
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(&format!("{}\n", a.chat_id));
+            std::fs::write(&path, s)?;
+            println!(
+                "approved chat {} (allowlist: {})",
+                a.chat_id,
+                path.display()
+            );
+            Ok(())
+        }
     }
+}
+
+async fn run(args: RunArgs) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
@@ -64,10 +137,10 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     tracing::info!(
-        "gateway up: provider=telegram, control_plane={}",
+        "gateway up: provider=telegram, control_plane={} (allowlist re-read per message)",
         args.control_plane
     );
-    provider.run(&client, &ctl, &admins).await
+    provider.run(&client, &ctl).await
 }
 
 /// A control-plane HTTP client for the handful of endpoints the gateway uses.
@@ -170,12 +243,11 @@ trait ChatProvider: Send {
         self: Box<Self>,
         client: &'a reqwest::Client,
         ctl: &'a ControlPlane<'a>,
-        admins: &'a [i64],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
 
-fn allowed(chat_id: i64, admins: &[i64]) -> bool {
-    admins.contains(&chat_id)
+fn allowed(chat_id: i64) -> bool {
+    load_admins().contains(&chat_id)
 }
 
 async fn dispatch(ctl: &ControlPlane<'_>, text: &str) -> String {
@@ -215,7 +287,7 @@ async fn dispatch(ctl: &ControlPlane<'_>, text: &str) -> String {
     }
 }
 
-const HELP: &str = "agentgrid gateway — /help /nodes /tasks /show <id> /cancel <id> /logs <id> /run <repo-url> <adapter> <prompt...>";
+const HELP: &str = "agentgrid gateway — /help /whoami /nodes /tasks /show <id> /cancel <id> /logs <id> /run <repo-url> <adapter> <prompt...>. /start and /whoami are open (they show your chat id + the host-side approval command).";
 
 // ---- formatting ----
 
@@ -291,7 +363,6 @@ impl ChatProvider for Telegram {
         self: Box<Self>,
         client: &'a reqwest::Client,
         ctl: &'a ControlPlane<'a>,
-        admins: &'a [i64],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         let tg = self;
         Box::pin(async move {
@@ -343,7 +414,34 @@ impl ChatProvider for Telegram {
                     if !text.starts_with('/') {
                         continue;
                     }
-                    if !allowed(chat_id, admins) {
+                    // /start and /whoami are open: echo the chat id + the
+                    // host-side approval command so an operator can confirm
+                    // ownership. Everything else needs the chat in the allowlist.
+                    let cmd_only = text
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .split('@')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches('/');
+                    if matches!(cmd_only, "start" | "whoami") {
+                        tracing::info!("tg {chat_id}: open command {cmd_only}");
+                        let reply = format!(
+                            "your chat id is {chat_id}\n\
+to drive the gateway, run on this host:\n\
+  agentgrid-gateway allow {chat_id}\n\
+then send /nodes\n\
+(this confirms you have shell access to the host where the gateway runs)"
+                        );
+                        let _ = client
+                            .post(tg.url("sendMessage"))
+                            .json(&serde_json::json!({"chat_id": chat_id, "text": reply}))
+                            .send()
+                            .await;
+                        continue;
+                    }
+                    if !allowed(chat_id) {
                         tracing::info!("ignoring chat {chat_id} (not in allowlist)");
                         continue;
                     }
