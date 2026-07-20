@@ -56,6 +56,22 @@ fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Per-worktree path to git's `info/exclude`, resolved via `git rev-parse`
+/// so linked worktrees get their own gitdir-scoped file, not the shared clone's.
+fn worktree_git_info_exclude(ws: &Path) -> Option<PathBuf> {
+    match git_out(ws, &["rev-parse", "--git-path", "info/exclude"]) {
+        Ok(s) if !s.is_empty() => {
+            let p = PathBuf::from(&s);
+            if p.is_absolute() {
+                Some(p)
+            } else {
+                Some(ws.join(p))
+            }
+        }
+        _ => Some(ws.join(".git").join("info").join("exclude")),
+    }
+}
+
 /// Reject git ref / slug tokens that could enable traversal or shell injection.
 /// Git is invoked without a shell, so this is defense-in-depth against malformed
 /// control-plane input (Stage 2.3).
@@ -145,6 +161,19 @@ pub fn prepare_workspace(
             start_point,
         ],
     )?;
+    // Stage 2.2: keep agent-side logs and our own patch out of the commit / diff.
+    // `.git/info/exclude` is per-worktree gitdir for linked worktrees, so this
+    // scopes to this attempt only and does not touch the shared clone.
+    let exclude = worktree_git_info_exclude(&ws);
+    if let Some(p) = exclude {
+        let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
+        for name in ["agent-raw-output.log", "validation.log", "changes.patch"] {
+            if !cur.contains(name) {
+                cur.push_str(&format!("{name}\n"));
+            }
+        }
+        std::fs::write(&p, cur)?;
+    }
     Ok(Workspace {
         path: ws,
         repo_dir: Some(repo_dir),
@@ -319,6 +348,61 @@ mod tests {
         assert!(sha.is_some());
         let patch = std::fs::read_to_string(&patch_path).unwrap();
         assert!(patch.contains("new.txt"), "patch missing new file: {patch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_and_validation_logs_excluded_from_commit_and_patch() {
+        // Stage 2.2: agent-side logs living inside the worktree (raw mirror,
+        // validation output) must never leak into the committed diff / patch.
+        let dir = std::env::temp_dir().join(format!("ag-git-leak-{}", uuid::Uuid::new_v4()));
+        let origin = dir.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(origin.join("base.txt"), "base").unwrap();
+        git(&origin, &["add", "-A"]).unwrap();
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        let a = make_assignment(origin.to_str().unwrap(), "main");
+        let ws = prepare_workspace(&dir.join("repos"), &dir.join("ws"), &a).unwrap();
+        // Agent writes a legit change plus the private logs node writes in-tree.
+        std::fs::write(ws.path.join("new.txt"), "hello").unwrap();
+        std::fs::write(ws.path.join("agent-raw-output.log"), "SECRET-RAW").unwrap();
+        std::fs::write(ws.path.join("validation.log"), "SECRET-VAL").unwrap();
+
+        let patch_path = ws.path.join("changes.patch");
+        let sha = finalize_workspace(ws, "agent@agentgrid").unwrap();
+        assert!(sha.is_some());
+        let patch = std::fs::read_to_string(&patch_path).unwrap();
+        assert!(
+            patch.contains("new.txt"),
+            "legit change missing from patch: {patch}"
+        );
+        assert!(
+            !patch.contains("agent-raw-output.log"),
+            "raw log leaked into patch: {patch}"
+        );
+        assert!(
+            !patch.contains("validation.log"),
+            "validation log leaked into patch: {patch}"
+        );
+        assert!(
+            !patch.contains("SECRET"),
+            "secret leaked into patch: {patch}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
