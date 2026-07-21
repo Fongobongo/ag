@@ -169,6 +169,9 @@ enum ApprovalAction {
 #[derive(Args)]
 struct ApprovalIdArgs {
     id: String,
+    /// Optional reason recorded with the decision (audit trail).
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Args)]
@@ -819,8 +822,12 @@ async fn cmd_approvals(client: &reqwest::Client, base: &str, a: ApprovalArgs) ->
             }
             Ok(())
         }
-        ApprovalAction::Allow(id) => answer_approval(client, base, &id.id, "allow").await,
-        ApprovalAction::Deny(id) => answer_approval(client, base, &id.id, "deny").await,
+        ApprovalAction::Allow(id) => {
+            answer_approval(client, base, &id.id, "allow", id.reason.as_deref()).await
+        }
+        ApprovalAction::Deny(id) => {
+            answer_approval(client, base, &id.id, "deny", id.reason.as_deref()).await
+        }
     }
 }
 
@@ -829,9 +836,14 @@ async fn answer_approval(
     base: &str,
     id: &str,
     decision: &str,
+    reason: Option<&str>,
 ) -> Result<()> {
+    let body = reason
+        .map(|r| serde_json::json!({ "reason": r }))
+        .unwrap_or_else(|| serde_json::json!({}));
     let resp = client
         .post(format!("{base}/v1/approvals/{id}/{decision}"))
+        .json(&body)
         .send()
         .await
         .context("approval answer request failed")?;

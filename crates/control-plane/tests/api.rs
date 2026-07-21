@@ -1493,12 +1493,12 @@ async fn approval_flow_allow_deny_and_expiry() {
     assert!(listed.iter().any(|a| a.id == ap_id));
     assert!(list_approvals(&app, Some("allowed")).await.is_empty());
 
-    // Allow it.
+    // Allow it with an operator reason, which is persisted and surfaced back.
     let allow = app
         .clone()
         .oneshot(post_json(
             &format!("/v1/approvals/{ap_id}/allow"),
-            "{}".into(),
+            r#"{"reason":"looked ok"}"#.into(),
             None,
         ))
         .await
@@ -1506,9 +1506,12 @@ async fn approval_flow_allow_deny_and_expiry() {
     assert_eq!(allow.status(), StatusCode::OK);
 
     let allowed = list_approvals(&app, Some("allowed")).await;
-    assert!(allowed
+    let got = allowed
         .iter()
-        .any(|a| a.id == ap_id && a.status == ApprovalStatus::Allowed));
+        .find(|a| a.id == ap_id)
+        .expect("allowed approval must be listed");
+    assert_eq!(got.status, ApprovalStatus::Allowed);
+    assert_eq!(got.reason.as_deref(), Some("looked ok"));
     assert!(list_approvals(&app, Some("pending")).await.is_empty());
 
     // Answering a terminal approval is a safe no-op (idempotent).

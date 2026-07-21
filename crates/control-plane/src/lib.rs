@@ -1505,14 +1505,16 @@ async fn allow_approval_handler(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthedUser>>,
     Path(id): Path<String>,
+    body: Option<Json<AnswerApprovalBody>>,
 ) -> StatusCode {
     let actor = auth
         .as_ref()
         .map(|e| e.0.username.as_str())
         .unwrap_or("system");
+    let reason = body.and_then(|b| b.0.reason).filter(|s| !s.is_empty());
     match state
         .store
-        .answer_approval(&id, ApprovalEvent::Allow, None, actor)
+        .answer_approval(&id, ApprovalEvent::Allow, reason.as_deref(), actor)
         .await
     {
         Ok(_) => StatusCode::OK,
@@ -1527,14 +1529,19 @@ async fn deny_approval_handler(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthedUser>>,
     Path(id): Path<String>,
+    body: Option<Json<AnswerApprovalBody>>,
 ) -> StatusCode {
     let actor = auth
         .as_ref()
         .map(|e| e.0.username.as_str())
         .unwrap_or("system");
+    let reason = body
+        .and_then(|b| b.0.reason)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "denied by operator".to_string());
     match state
         .store
-        .answer_approval(&id, ApprovalEvent::Deny, Some("denied by operator"), actor)
+        .answer_approval(&id, ApprovalEvent::Deny, Some(&reason), actor)
         .await
     {
         Ok(_) => StatusCode::OK,
@@ -1543,6 +1550,14 @@ async fn deny_approval_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnswerApprovalBody {
+    /// Optional operator reason recorded with the decision (shown in the UI/CLI
+    /// and audit). Omitted = default placeholder.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

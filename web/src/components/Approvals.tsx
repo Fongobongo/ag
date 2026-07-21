@@ -1,0 +1,97 @@
+import { useEffect, useState } from 'react';
+import { answerApproval, ApprovalView, listApprovals } from '../api';
+import { ApiError } from '../api';
+import { ErrorBox, Loading, StatusBadge, fmtTime } from './util';
+
+// Stage 9.2 operator approval UI: list pending approvals, allow/deny with a
+// recorded reason. Auto-polls every 3s so a fresh request_permission surfaces
+// without an operator refresh; terminal approvals (allowed/denied/expired)
+// are shown briefly for context then hidden on next fetch.
+
+const POLL_MS = 3000;
+
+export default function Approvals({ filter = 'pending' }: { filter?: string }) {
+  const [items, setItems] = useState<ApprovalView[] | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = () => {
+    listApprovals(filter === 'all' ? undefined : filter)
+      .then(setItems)
+      .catch(setError);
+  };
+  useEffect(() => {
+    load();
+    const t = setInterval(load, POLL_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter]);
+
+  const answer = async (a: ApprovalView, decision: 'allow' | 'deny') => {
+    const prompt = decision === 'allow'
+      ? `Reason for allowing "${a.permission}" (optional):`
+      : `Reason for denying "${a.permission}":`;
+    const reason = window.prompt(prompt, decision === 'deny' ? 'denied by operator' : '');
+    if (decision === 'deny' && (reason === null || reason.trim() === '')) return;
+    setBusy(a.id);
+    try {
+      const r = await answerApproval(a.id, decision, reason?.trim() || undefined);
+      if (!r.ok) setError(new Error(`${decision} failed (${r.status})`));
+      else load();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (error) return <ErrorBox err={error} />;
+  if (!items) return <Loading />;
+
+  return (
+    <section>
+      <h2>Approvals{filter !== 'all' && ` — ${filter}`}</h2>
+      {items.length === 0 ? (
+        <div className="muted">No {filter} approvals.</div>
+      ) : (
+        <table className="grid">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Scope</th>
+              <th>Permission</th>
+              <th>Task</th>
+              <th>Attempt</th>
+              <th>Created</th>
+              <th>Expires</th>
+              <th>Reason</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((a) => (
+              <tr key={a.id}>
+                <td><StatusBadge status={a.status} /></td>
+                <td>{a.scope}</td>
+                <td className="mono">{a.permission}</td>
+                <td className="mono"><a href={`#/task/${a.task_id}`}>{a.task_id.slice(0, 8)}</a></td>
+                <td className="mono">{a.attempt_id.slice(0, 8)}</td>
+                <td>{fmtTime(a.created_at)}</td>
+                <td>{fmtTime(a.expires_at)}</td>
+                <td>{a.reason || '—'}</td>
+                <td>
+                  {a.status === 'pending' && (
+                    <>
+                      <button className="ok" disabled={busy === a.id} onClick={() => answer(a, 'allow')}>Allow</button>{' '}
+                      <button className="danger" disabled={busy === a.id} onClick={() => answer(a, 'deny')}>Deny</button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}

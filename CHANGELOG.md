@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (approvals — operator UI + CLI reason, Stage 9.2)
+
+- Control plane `POST /v1/approvals/{id}/{allow|deny}` now accepts an optional
+  `{ "reason": "…" }` JSON body; the reason is persisted on the approval and
+  surfaced back via `GET /v1/approvals[?status=]` / `GET /v1/approvals/{id}`
+  (audit trail). Empty/absent body keeps the prior behavior (allow = no reason,
+  deny = `denied by operator`). Covered by `approval_flow_allow_deny_and_expiry`
+  (allow-with-reason round-trip assertion).
+- CLI `ag approvals allow/deny <id> --reason "…"` sends that body. `list`
+  was already present (Stage 5); unchanged.
+- Web UI: new Approvals view at `#/approvals` (nav button). Lists approvals —
+  default filter `pending`, an `?…` shows all statuses — with status / scope /
+  permission / task / attempt / created / expires / reason columns, and
+  Allow/Deny buttons on pending rows. The decision prompts for an operator
+  reason (deny requires a non-empty reason), then POSTs the answer; the list
+  auto-polls every 3s so a fresh `session/request_permission` surfaces without
+  a manual refresh. Closes the Этап 9.2 checkbox for an operator approval UI.
+
 - node-daemon: bound the child reap after ACP session cancel/timeout. A child
   that ignored SIGTERM (or a pidfd that never fired) could previously park
   `drive_acp_session` forever after the session timeout — now wrapped in

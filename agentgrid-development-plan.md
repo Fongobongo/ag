@@ -281,6 +281,9 @@
 - [x] Autonomy levels L0–L4 в profile (default L2 patch)
 - [x] Approval API: `POST /v1/approvals/{id}` (scope: tool call / session / step / command digest / duration)
 - [ ] Approval UI в web (список pending, allow/deny с причиной) и CLI (`ag approvals list/approve/deny`)
+  - [x] CLI `ag approvals list/allow/deny` (с `--reason` для audit-trail) —_BASE с Stage 5
+  - [x] CP принимають опциональный `reason` в `POST /v1/approvals/{id}/{allow|deny}` (по умолчанию placeholder)
+  - [x] Web UI раздела Approvals (hash `#/approvals`): список (по умолчанию `pending`, filter=all — все), автополл 3 s, allow/deny через `window.prompt` с записью reason; reason/task дрожат в таблице. Covered `approval_flow_allow_deny_and_expiry` (CPHz тест проверят persists reason)
 - [x] Audit event на каждое policy decision и approval
 - [ ] Skill trust management UI/CLI
 - [x] Timeout неотвеченного approval → step `blocked`, не висящий run

@@ -50,6 +50,20 @@ export interface RepositoryView {
   created_at: string;
 }
 
+export interface ApprovalView {
+  id: string;
+  task_id: string;
+  attempt_id: string;
+  session_id?: string | null;
+  permission: string;
+  status: 'pending' | 'allowed' | 'denied' | 'expired' | 'cancelled';
+  reason?: string | null;
+  scope: string;
+  created_at: string;
+  expires_at: string;
+  decided_at?: string | null;
+}
+
 export interface NodeEligibility {
   node_id: string;
   status: string;
@@ -198,6 +212,14 @@ export function cancelTask(id: string) {
 
 export function retryTask(id: string) {
   return req('POST', `/v1/tasks/${id}/retry`, {});
+}
+
+export function listApprovals(status?: string) {
+  return getJson<ApprovalView[]>(status ? `/v1/approvals?status=${encodeURIComponent(status)}` : '/v1/approvals');
+}
+
+export function answerApproval(id: string, decision: 'allow' | 'deny', reason?: string) {
+  return req('POST', `/v1/approvals/${id}/${decision}`, reason ? { reason } : {});
 }
 
 export async function getArtifact(taskId: string, name: string): Promise<string | null> {
