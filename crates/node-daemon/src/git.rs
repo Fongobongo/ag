@@ -18,9 +18,10 @@ use std::sync::{Mutex, OnceLock};
 use agentgrid_common::Assignment;
 use anyhow::{Context, Result};
 
-/// Per-repo in-process lock (Stage 2.3): the shared clone's `fetch` +
-/// `checkout -B` + `worktree add` are serialized per repository so two
-/// parallel attempts of one repo cannot race the clone state. Each attempt
+/// Per-repo in-process lock (Stage 2.3): the bare-mirror clone's `fetch` +
+/// `worktree add` are serialized per repository so two parallel attempts of one
+/// repo cannot race the clone state (no more `checkout -B` on a shared
+/// clone). Each attempt
 /// still gets its own worktree, so agent work runs concurrently.
 static REPO_LOCKS: OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
 
@@ -141,15 +142,29 @@ pub fn prepare_workspace(
     let gurl = assignment.git_url.as_str();
     let repo = assignment.repository.as_str();
 
-    // Stage 2.3: serialize shared-clone mutations (fetch / checkout -B /
-    // worktree add) per repository across concurrent attempts.
+    // Stage 2.3: serialize shared bare-mirror mutations (fetch / worktree
+    // add) per repository across concurrent attempts.
     let _repo_arc = repo_lock(repo);
     let _repo_guard = _repo_arc.lock().unwrap();
 
+    // Stage 2.3 (bare mirror): keep a single bare `--mirror` clone per repo so
+    // the shared clone has no working tree and no HEAD to mutate — attempts no
+    // longer `checkout -B` a branch into the shared clone (which flapped HEAD
+    // between parallel attempts using different default branches/commits).
+    // All refs are mirrored under the same names (`refs/heads/main` etc.), so
+    // the default branch is addressed by `db` directly (no `origin/` prefix).
+    if repo_dir.join("HEAD").exists() {
+        // Already a bare mirror: refresh all refs.
+        git(&repo_dir, &["fetch", "origin", "--prune"])?;
+    } else {
+        std::fs::create_dir_all(repository_root)?;
+        git(repository_root, &["clone", "--mirror", gurl, repo])?;
+    }
+
     // Stage 8: if a fixed base_commit is requested, every attempt of this step
     // starts from that exact commit (parallel workers share it). Best-effort
-    // fetch so the commit is present locally, then validate the token
-    // (defense-in-depth: git is invoked without a shell).
+    // fetch so the commit is present locally; validate the token (defense in
+    // depth).
     let base_commit = assignment
         .base_commit
         .as_ref()
@@ -164,13 +179,6 @@ pub fn prepare_workspace(
         })
         .transpose()?;
 
-    if repo_dir.join(".git").exists() {
-        git(&repo_dir, &["fetch", "origin", db])?;
-    } else {
-        std::fs::create_dir_all(repository_root)?;
-        git(repository_root, &["clone", gurl, repo])?;
-    }
-    git(&repo_dir, &["checkout", "-B", db, &format!("origin/{db}")])?;
     let start_point = base_commit.unwrap_or(db);
     git(
         &repo_dir,

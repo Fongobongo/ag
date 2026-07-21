@@ -94,7 +94,7 @@
 - [x] Adversarial tests: пробелы, кавычки, `;`, `$()`, `..` в git_url/repo name/branch
 - [x] Per-repository async lock + file lock: fetch, checkout, `worktree add`, cleanup сериализованы
 - [x] Test: два параллельных attempts одного repo не ломают clone state
-- [ ] Убрать `checkout -B` в shared clone → bare mirror либо detached ref; worktree от зафиксированного commit
+- [x] Убрать `checkout -B` в shared clone → bare mirror либо detached ref; worktree от зафиксированного commit (теперь bare-mirror clone `--mirror`: shared clone без рабочей копии/HEAD, fetch refresит refs, `worktree add -b branch ws <commit|db>` пинит start_point; git-тесты зелёные; `checkout -B` убран)
 - [x] Добавить `base_commit` в `Assignment`; фиксировать его при fetch
 - [x] Worktree/branch cleanup: graceful `git worktree remove --force` + `git branch -D` after each terminal attempt (ACP + mock + adapter-missing paths); startup reconciliation `prune_stale_workspaces` removes workspace dirs older than `AGENTGRID_WORKSPACE_RETENTION_HOURS` (default 24h, 0 disables) and `git worktree prune`s each repo. Background periodic job deferred (startup reconcile + per-attempt cleanup covers the common cases; a killed node's stale dirs are swept on next startup, not immediately)
 - [x] Artifacts retention на control plane (168h default) + фоновая очистка

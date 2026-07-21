@@ -120,6 +120,20 @@ complete; the two-container E2E run is the release validation gate.
   cases. Covered by `cleanup_workspace_removes_worktree_and_branch`,
   `cleanup_workspace_plain_dir_no_git`, `prune_stale_workspaces_removes_old_keeps_fresh`.
 
+### Changed (node — bare-mirror shared clone, Stage 2.3)
+
+- The per-repository shared clone is now a `git clone --mirror` (bare): it has
+  no working tree and no HEAD to mutate. Prior runs did `git checkout -B db
+  origin/db` into the shared clone on every attempt, flapping HEAD between
+  parallel attempts that used different default branches / base commits — the
+  per-repo lock serialized it but the semantics were wrong. Now `fetch origin
+  --prune` refreshes all mirror refs (under the same names, so the default
+  branch is addressed by `db` with no `origin/` prefix) and `git worktree add
+  -b branch ws <base>` pins the start point; `checkout -B` is gone. Covered by
+  the existing git tests (`worktree_commit_and_patch`, `base_commit`,
+  `parallel_prep_same_repo_does_not_race`), which now run against a bare
+  mirror clone.
+
 ### Added (node — event backpressure + `output_truncated`, Stage 2.1)
 
 - `EventSink` now caps its RAM buffer per attempt at `AGENTGRID_EVENT_BUF_BYTES` (default 4 MiB). Once over the cap, ordinary log/usage events (`stdout`/`stderr`/`metric`) are dropped and exactly one `output_truncated` status notice is emitted; terminal-state events (`status`/`result`/`error`) and `tool` calls are never dropped, so logs can't starve terminal state. The budget is released as the flusher drains. Covered by `event_sink_drops_logs_over_cap_but_keeps_terminal_state`.
