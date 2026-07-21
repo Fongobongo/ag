@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (node — command-policy integration into ACP permission flow, Stage 9.1)
+
+- The node daemon now short-circuits `session/request_permission` through the
+  builtin `CommandPolicyProvider` **before** creating an operator approval. For
+  a Bash-style request (`permission = {tool:"Bash", input:"<cmd>"}`):
+  - `Allow` (e.g. `cat`, `ls` at L2) → the agent proceeds with no operator
+    round-trip; a `permission_decision` status event is still streamed so the
+    operator sees what was auto-permitted.
+  - `Deny` (e.g. `rm -rf` at L2) → the request is rejected outright.
+  - `Ask` (e.g. `git push`, package installs) → falls through to the durable
+    approval flow (`POST /v1/tasks/{id}/approvals`) unchanged.
+- Any non-Bash tool, a missing `input`, or a provider error also reaches the
+  approval flow — fail-closed to the operator. Autonomy level is read from
+  `AGENTGRID_AUTONOMY` (`l0`..`l4`, default `l2`); the CP `POST /v1/policy/evaluate`
+  mirrors the same matrix. Covered by `policy_decision_short_circuits_bash` /
+  `policy_decision_non_bash_is_none`.
+- **Enforcement boundary documented** in `docs/acp-interop.md`: a wrapper
+  adapter (an arbitrary binary emitting JSON lines, without structured tool
+  calls) cannot be fully intercepted by this layer — there is no
+  `session/request_permission` to hook. For a strict/unattended profile, pair a
+  wrapper adapter with a sandbox/backend policy (Stage 12); the ACP native
+  launcher is the forward path and is fully intercepted.
+
 ### Added (approvals — operator UI + CLI reason, Stage 9.2)
 
 - Control plane `POST /v1/approvals/{id}/{allow|deny}` now accepts an optional

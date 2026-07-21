@@ -15,6 +15,7 @@ use agentgrid_acp::{
 };
 use agentgrid_adapters::{to_event_type, AdapterEvent, ExecutionBackend};
 use agentgrid_common::{
+    policy::{AutonomyLevel, BuiltinPolicyProvider, PolicyDecision},
     AdapterCapability, AgentEventEnvelope, ApprovalStatus, ApprovalView, Assignment, CancelState,
     CompleteAttemptRequest, CreateAgentSessionRequest, EnrollRequest, EnrollResponse, EventKind,
     EventType, HeartbeatRequest, IncomingEvent, IngestEventsRequest, NodeStatus, PollRequest,
@@ -55,6 +56,10 @@ struct Config {
     outbox_root: PathBuf,
     /// Stage 2.1: a single durable completion spool (idempotent redelivery).
     completion_outbox: Arc<outbox::CompletionOutbox>,
+    /// Stage 9.1: command-policy autonomy level driving the local
+    /// short-circuit in `session/request_permission` (Allow/Deny) before the
+    /// approval flow is reached.
+    autonomy: AutonomyLevel,
 }
 
 /// Node identity persisted to disk after enrollment (never re-sent in plaintext).
@@ -168,7 +173,17 @@ fn config_from_env() -> Config {
                 outbox::CompletionOutbox::open(&std::env::temp_dir()).unwrap()
             })
         }),
+        autonomy: parse_autonomy(std::env::var("AGENTGRID_AUTONOMY").ok()),
     }
+}
+
+/// Stage 9.1: parse the command-policy autonomy level from an env string
+/// like `l0`..`l4` (case-insensitive). Unknown / missing → default (`L2`).
+fn parse_autonomy(v: Option<String>) -> AutonomyLevel {
+    let Some(v) = v else {
+        return AutonomyLevel::default();
+    };
+    serde_json::from_value(serde_json::Value::String(v.to_lowercase())).unwrap_or_default()
 }
 
 /// Parse `KEY=VALUE` pairs from an env var (space/newline/comma separated).
@@ -726,6 +741,7 @@ async fn drive_acp_session(
     let acp2 = acp.clone();
     let client2 = client.clone();
     let server2 = cfg.server.clone();
+    let autonomy = cfg.autonomy;
     let stream_task = tokio::spawn(async move {
         while let Some(msg) = notif.recv().await {
             match msg {
@@ -745,6 +761,8 @@ async fn drive_acp_session(
                         &attempt_id,
                         &sid,
                         &params,
+                        autonomy,
+                        &sink2,
                     )
                     .await;
                     let _ = acp2.respond(id, allow).await;
@@ -805,8 +823,17 @@ async fn drive_acp_session(
     Ok(outcome)
 }
 
-/// Stage 5: create a durable approval for an agent permission request and poll
-/// until an operator answers. Fail-closed: any error or timeout denies.
+/// Stage 5/9.1: answer `session/request_permission`. First the builtin
+/// command-policy provider classifies the requested command; an `Allow`
+/// short-circuits (no operator round-trip), `Deny` is rejected outright, and
+/// only `Ask` falls through to the durable operator approval flow below.
+/// Fail-closed: any error or timeout denies.
+///
+/// The provider handles only Bash-style shell commands (the common ACP case,
+/// `permission = {tool:"Bash", input:"<cmd>"}`); other tools always reach the
+/// approval flow — see `enforcement_boundary` doc: a wrapper adapter without
+/// structured tool calls cannot be fully intercepted.
+#[allow(clippy::too_many_arguments)]
 async fn request_permission(
     client: &reqwest::Client,
     server: &str,
@@ -814,7 +841,26 @@ async fn request_permission(
     attempt_id: &str,
     session_id: &str,
     permission: &Value,
+    autonomy: AutonomyLevel,
+    sink: &Arc<EventSink>,
 ) -> bool {
+    // Stage 9.1 local short-circuit for Bash commands.
+    if let Some(decision) = policy_decision(permission, autonomy) {
+        sink.push(
+            EventType::Status,
+            json!({
+                "kind": "permission_decision",
+                "decision": decision.0,
+                "risk_class": decision.1,
+                "reason": decision.2,
+                "source": "local_policy",
+                "autonomy": autonomy,
+            }),
+        )
+        .await;
+        return decision.0 == PolicyDecision::Allow;
+    }
+    // Fall through: ask the operator via the durable approval flow.
     let create = client
         .post(format!("{server}/v1/tasks/{task_id}/approvals"))
         .json(&json!({ "attempt_id": attempt_id, "session_id": session_id, "permission": permission }))
@@ -853,6 +899,34 @@ async fn request_permission(
         }
     }
     false
+}
+
+/// Stage 9.1: evaluate a `session/request_permission` against the builtin
+/// command policy. Returns `Some((decision, risk_class, reason))` only for a
+/// definitive local `Allow`/`Deny` of a Bash-style shell command
+/// (`{tool:"Bash", input:"<cmd>"}`); `Ask` and non-Bash tools return `None`
+/// (→ approval flow, fail-closed to the operator).
+fn policy_decision(
+    permission: &Value,
+    autonomy: AutonomyLevel,
+) -> Option<(PolicyDecision, String, String)> {
+    let tool = permission.get("tool").and_then(|v| v.as_str())?;
+    if !tool.eq_ignore_ascii_case("bash") {
+        return None;
+    }
+    let cmd = permission.get("input").and_then(|v| v.as_str())?;
+    let verdict = BuiltinPolicyProvider::new()
+        .evaluate_with(autonomy, cmd, "")
+        .ok()?;
+    // `Ask` is not a local decision: fall through to the operator approval flow.
+    if verdict.decision == PolicyDecision::Ask {
+        return None;
+    }
+    Some((
+        verdict.decision,
+        format!("{:?}", verdict.risk_class),
+        verdict.reason,
+    ))
 }
 
 async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignment) -> Result<()> {
@@ -1790,6 +1864,51 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Stage 9.1: a Bash `cat` at default L2 is auto-allowed; `rm -rf` is
+    /// auto-denied; `git push` yields `Ask` (None) → falls to approval flow.
+    #[test]
+    fn policy_decision_short_circuits_bash() {
+        let allow = policy_decision(
+            &json!({ "tool": "Bash", "input": "cat README.md" }),
+            AutonomyLevel::L2,
+        )
+        .unwrap();
+        assert_eq!(allow.0, PolicyDecision::Allow);
+
+        let deny = policy_decision(
+            &json!({ "tool": "Bash", "input": "rm -rf /tmp/x" }),
+            AutonomyLevel::L2,
+        )
+        .unwrap();
+        assert_eq!(deny.0, PolicyDecision::Deny);
+
+        assert_eq!(
+            policy_decision(
+                &json!({ "tool": "Bash", "input": "git push" }),
+                AutonomyLevel::L2,
+            ),
+            None,
+            "Ask (git push @ L2) must fall through to the approval flow"
+        );
+    }
+
+    #[test]
+    fn policy_decision_non_bash_is_none() {
+        // Non-Bash tools are never short-circuited locally → operator decides.
+        assert_eq!(
+            policy_decision(
+                &json!({ "tool": "WebFetch", "input": "x" }),
+                AutonomyLevel::L4
+            ),
+            None
+        );
+        assert_eq!(
+            policy_decision(&json!({ "tool": "Bash" }), AutonomyLevel::L4),
+            None,
+            "missing input → no short-circuit"
+        );
+    }
+
     /// A temporary EventOutbox for a given attempt, isolated per test run.
     fn test_outbox(attempt_id: &str) -> Arc<outbox::EventOutbox> {
         let dir = std::env::temp_dir().join(format!("ag-outbox-test-{}", uuid::Uuid::new_v4()));
@@ -1996,6 +2115,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            autonomy: AutonomyLevel::default(),
         };
         let ws = std::env::temp_dir().join(format!(
             "ag-acp-{}-{}",
@@ -2097,6 +2217,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            autonomy: AutonomyLevel::default(),
         };
         let ws = std::env::temp_dir().join(format!(
             "ag-acp-hang-{}-{}",
