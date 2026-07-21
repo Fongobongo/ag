@@ -121,7 +121,7 @@
 - [x] Transport security для разных ПК: TLS обязателен вне loopback; documented reverse-proxy mode на 0.1.1, roadmap native TLS/mTLS; enrollment tokens одноразовые и с TTL
 - [x] Protocol versioning: `protocol_version` в enroll/heartbeat/poll; N/N-1 совместимость; несовместимая node → `degraded(incompatible_protocol)`
 - [x] Метрики: event spool size, SQLITE_BUSY count, checkpoint duration (cp `agentgrid_sqlite_checkpoint_ms` + `agentgrid_sqlite_busy_total` added; outbox size surfaced via node startup log; `agentgrid_sqlite_wal_bytes`/`db_bytes` already present)
-- [ ] Обновить threat model и CHANGELOG; выпустить тег `v0.1.1`
+- [x] Обновить threat model и CHANGELOG; выпустить тег `v0.1.1` (threat model в `docs/decisions/threat-model.md` (T1–T14), CHANGELOG [0.1.1], upgrade guide `docs/upgrade-0.1.0-to-0.1.1.md`, тег `v0.1.1` на `36e26f2`; последующие фикс-ы надёжности `d51b177..5f9a2ff` — durable ground-truth event drain, SQLITE_BUSY maintenance cadence, worktree/branch cleanup, bare-mirror clone — описаны в тех же [0.1.1] записях и делают релиз стабильным; отдельный тег для них не отрезан — follow-up, если внешний выпуск их потребует)
 
 **Exit 2 (релиз 0.1.1):** ни events, ни completion, ни artifacts не теряются при сетевых сбоях и рестартах; secret-leak и injection тесты зелёные; параллельные attempts одного repo безопасны; adapters маршрутизируются честно.
 
@@ -190,7 +190,7 @@
 - [x] Conformance fixtures: initialize/session-new/plan-update/tool-call/diff/permission/cancel (acp crate tests: lifecycle + full `session/update` vocabulary mapping + `session/cancel` acknowledged)
 - [ ] Запустить минимум один реальный ACP-compatible agent E2E (локально и на удалённой node)
 - [ ] Test: cancellation обрывает prompt turn и завершает attempt `cancelled`
-- [ ] Test: kill ACP subprocess посреди JSON frame → attempt корректно failed, без зависания
+- [x] Test: kill ACP subprocess посреди JSON frame → attempt корректно failed, без зависания (fake-acp `AG_FAKE_HANG` writes truncated JSON-RPC line then blocks forever; session timeout fires → terminate_group + bounded reap `tokio::time::timeout(12s, child.wait())` so a child ignoring SIGTERM can't park `drive_acp_session` forever; test `drive_acp_session_hang_mid_frame_times_out`)
 
 **Exit 5:** Agentgrid node запускает ACP agent без agent-specific парсера; plan/tool/diff видны в UI.
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+- node-daemon: bound the child reap after ACP session cancel/timeout. A child
+  that ignored SIGTERM (or a pidfd that never fired) could previously park
+  `drive_acp_session` forever after the session timeout — now wrapped in
+  `tokio::time::timeout(12s, child.wait())` matching the SIGKILL escalation.
+- node-daemon: `AG_FAKE_HANG` test mode in the fake ACP agent (writes a
+  truncated JSON-RPC line then blocks) + test `drive_acp_session_hang_mid_frame_times_out`
+  covering "kill ACP subprocess mid-JSON-frame → attempt failed, no hang"
+  (plan Этап 5, line 193).
+
 ## [0.1.1] — correctness & security hardening
 
 Stage 1–2 hardening of the 0.1.0 MVP: truthful statuses / outcome model, lost-node

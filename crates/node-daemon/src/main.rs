@@ -778,12 +778,25 @@ async fn drive_acp_session(
         },
         _ = wait_for_cancel(cancel_client, cancel_url) => {
             acp.session_cancel(SessionCancelParams { session_id: session_id.clone() }).await.ok();
-            let _ = child.wait().await;
+            // Bound the reap for the same reason as the timeout branch.
+            terminate_group(pid);
+            let _ = tokio::time::timeout(
+                Duration::from_secs(12),
+                child.wait(),
+            )
+            .await;
             AcpResult { success: false, error_code: Some("cancelled".into()), session_id: Some(session_id.clone()) }
         }
         _ = tokio::time::sleep(timeout) => {
             terminate_group(pid);
-            let _ = child.wait().await;
+            // Bound the reap so a child that ignores SIGTERM (or a pidfd that
+            // never fires) can't park the session forever. terminate_group
+            // escalates to SIGKILL after 10s, so allow a little slack.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(15),
+                child.wait(),
+            )
+            .await;
             AcpResult { success: false, error_code: Some("timeout".into()), session_id: Some(session_id.clone()) }
         }
     };
@@ -2030,6 +2043,106 @@ mod tests {
             sink.adapter_event_count() >= 2,
             "two session/update events should stream; got {}",
             sink.adapter_event_count()
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Stage 5: an ACP subprocess that hangs mid-frame (writes a truncated
+    /// JSON line then blocks forever) must be torn down by the session
+    /// timeout — the attempt fails with `timeout`, no hang.
+    #[tokio::test]
+    async fn drive_acp_session_hang_mid_frame_times_out() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let fake = [
+            "../../target/debug/adapter-fake-acp",
+            "../../target/release/adapter-fake-acp",
+        ]
+        .iter()
+        .map(|p| std::path::Path::new(manifest).join(p))
+        .find(|p| p.is_file())
+        .expect("fake ACP agent built");
+        let bin_dir = fake.parent().unwrap();
+        let orig = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{orig}", bin_dir.display()));
+        // Fake agent: write a truncated JSON-RPC line then block forever.
+        std::env::set_var("PATH", format!("{}:{orig}", bin_dir.display()));
+        let server = dummy_ingest_server().await;
+        // Fake agent: write a truncated JSON-RPC line then block forever.
+        // Pass via adapter_env so it only reaches THIS child (no env cross-talk
+        // with parallel ACP tests in the same process).
+        let cfg = Config {
+            server: server.clone(),
+            node_name: "test".into(),
+            workspace_root: std::env::temp_dir().join("ag-acp-ws-hang"),
+            max_concurrency: 2,
+            agent_version: "0.1.0".into(),
+            adapters: vec![AdapterSpec {
+                id: "fake-acp".into(),
+                protocol: AdapterProtocol::Acp,
+            }],
+            repositories: vec!["*".into()],
+            heartbeat_secs: 10,
+            enroll_token: None,
+            credential_path: std::env::temp_dir().join("ag-acp-cred-hang.json"),
+            repository_root: std::env::temp_dir().join("ag-acp-repos-hang"),
+            secrets: vec![],
+            sandbox: sandbox::SandboxKind::None,
+            adapter_env: vec![("AG_FAKE_HANG".into(), "1".into())],
+            outbox_root: std::env::temp_dir()
+                .join(format!("ag-acp-outbox-hang-{}", uuid::Uuid::new_v4())),
+            completion_outbox: Arc::new(
+                outbox::CompletionOutbox::open(
+                    &std::env::temp_dir()
+                        .join(format!("ag-acp-comp-hang-{}", uuid::Uuid::new_v4())),
+                )
+                .unwrap(),
+            ),
+        };
+        let ws = std::env::temp_dir().join(format!(
+            "ag-acp-hang-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let assignment = Assignment {
+            attempt_id: format!("att-hang-{}", uuid::Uuid::new_v4()),
+            task_id: "t1".into(),
+            repository: "*".into(),
+            prompt: "do the thing".into(),
+            adapter: "fake-acp".into(),
+            number: 1,
+            timeout_secs: 3,
+            git_url: String::new(),
+            default_branch: String::new(),
+            validation_command: None,
+            base_commit: None,
+            parent_acp_session_id: None,
+        };
+        let sink = EventSink::new(
+            assignment.attempt_id.clone(),
+            reqwest::Client::new(),
+            cfg.server.clone(),
+            Arc::new(outbox::EventOutbox::open(&cfg.outbox_root, &assignment.attempt_id).unwrap()),
+        );
+        let res = tokio::time::timeout(
+            Duration::from_secs(20),
+            drive_acp_session(
+                &cfg,
+                &reqwest::Client::new(),
+                &assignment,
+                &ws,
+                sink.clone(),
+            ),
+        )
+        .await
+        .expect("drive_acp_session must not hang on a mid-frame ACP death")
+        .unwrap();
+        assert!(!res.success, "hung ACP session should not succeed");
+        assert_eq!(
+            res.error_code.as_deref(),
+            Some("timeout"),
+            "expected timeout error_code, got {:?}",
+            res.error_code
         );
         std::fs::remove_dir_all(&ws).ok();
     }

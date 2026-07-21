@@ -42,6 +42,20 @@ fn main() {
                 writeln!(out, "{}", resp).ok();
             }
             "session/prompt" => {
+                // Test mode: hang mid-frame. Write the start of a JSON-RPC
+                // `session/update` line with no terminating newline and block
+                // forever, simulating an ACP subprocess that dies mid-frame
+                // (truncated JSON). The node must time out and fail the attempt.
+                if std::env::var_os("AG_FAKE_HANG").is_some() {
+                    // Truncated JSON-RPC line (no close brace, no newline).
+                    let partial = r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"type":"progress","text":"thi"#;
+                    out.write_all(partial.as_bytes()).ok();
+                    out.flush().ok();
+                    // Block forever; the node's cancel/timeout must tear us down.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
                 // Emit two updates, then the prompt result.
                 let u1 = json!({
                     "jsonrpc": "2.0",
