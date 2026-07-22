@@ -110,6 +110,64 @@ impl WorkflowTemplate {
     pub fn from_yaml(s: &str) -> Result<Self, serde_yaml::Error> {
         serde_yaml::from_str(s)
     }
+
+    /// Validate the step graph is a well-formed DAG (ADR 0004). Returns the
+    /// first structural violation as a named error string, or `Ok(())`.
+    /// Checks: unique ids, no self-dep, no orphan dep, acyclic.
+    pub fn validate_dag(&self) -> Result<(), String> {
+        let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in &self.steps {
+            if !ids.insert(s.id.as_str()) {
+                return Err(format!("duplicate step id: {}", s.id));
+            }
+        }
+        let known: std::collections::HashSet<&str> =
+            self.steps.iter().map(|s| s.id.as_str()).collect();
+        for s in &self.steps {
+            for dep in &s.depends_on {
+                if dep == &s.id {
+                    return Err(format!("self-dependency: {}", s.id));
+                }
+                if !known.contains(dep.as_str()) {
+                    return Err(format!("unknown dependency {dep} on step {}", s.id));
+                }
+            }
+        }
+        // Acyclic via DFS colour-mark (white/gray/black). A gray revisit = cycle.
+        let adj: std::collections::HashMap<&str, &Vec<String>> = self
+            .steps
+            .iter()
+            .map(|s| (s.id.as_str(), &s.depends_on))
+            .collect();
+        let mut color: std::collections::HashMap<&str, u8> = std::collections::HashMap::new(); // 0=white,1=gray,2=black
+        for s in &self.steps {
+            if color.get(s.id.as_str()).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            let mut stack: Vec<(&str, usize)> = vec![(s.id.as_str(), 0)];
+            while let Some(&(node, i)) = stack.last() {
+                let deps = adj[node];
+                if i == 0 {
+                    color.insert(node, 1);
+                }
+                if i < deps.len() {
+                    let next = deps[i].as_str();
+                    stack.last_mut().unwrap().1 += 1;
+                    let c = color.get(next).copied().unwrap_or(0);
+                    if c == 1 {
+                        return Err(format!("cycle detected via {node} -> {next}"));
+                    }
+                    if c == 0 {
+                        stack.push((next, 0));
+                    }
+                } else {
+                    color.insert(node, 2);
+                    stack.pop();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +196,80 @@ steps:
         let json = serde_json::to_string(&t).unwrap();
         let back: WorkflowTemplate = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, t.name);
+    }
+
+    fn tmpl(steps: &[(&str, &[&str])]) -> WorkflowTemplate {
+        WorkflowTemplate {
+            id: "t".into(),
+            name: "x".into(),
+            created_at: "".into(),
+            steps: steps
+                .iter()
+                .map(|(id, deps)| WorkflowStep {
+                    id: (*id).into(),
+                    prompt: "".into(),
+                    role: WorkflowRole::Worker,
+                    depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+                    adapter: None,
+                    requested_node_id: None,
+                    base_commit: None,
+                    retryable: None,
+                    max_attempts: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_dag_accepts_simple_chain() {
+        assert!(
+            tmpl(&[("plan", &[]), ("work", &["plan"]), ("verify", &["work"])])
+                .validate_dag()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_dag_accepts_parallel_fan_out() {
+        assert!(
+            tmpl(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])])
+                .validate_dag()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_dag_rejects_duplicate_ids() {
+        let e = tmpl(&[("a", &[]), ("a", &[])]).validate_dag().unwrap_err();
+        assert!(e.contains("duplicate step id"));
+    }
+
+    #[test]
+    fn validate_dag_rejects_self_dep() {
+        let e = tmpl(&[("a", &["a"])]).validate_dag().unwrap_err();
+        assert!(e.contains("self-dependency"));
+    }
+
+    #[test]
+    fn validate_dag_rejects_orphan_dep() {
+        let e = tmpl(&[("a", &["nope"])]).validate_dag().unwrap_err();
+        assert!(e.contains("unknown dependency nope"));
+    }
+
+    #[test]
+    fn validate_dag_rejects_direct_cycle() {
+        let e = tmpl(&[("a", &["b"]), ("b", &["a"])])
+            .validate_dag()
+            .unwrap_err();
+        assert!(e.contains("cycle detected"));
+    }
+
+    #[test]
+    fn validate_dag_rejects_transitive_cycle() {
+        let e = tmpl(&[("a", &["c"]), ("b", &["a"]), ("c", &["b"])])
+            .validate_dag()
+            .unwrap_err();
+        assert!(e.contains("cycle detected"));
     }
 }
 

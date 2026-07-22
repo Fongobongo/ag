@@ -300,6 +300,33 @@ fn agent_profile(adapter_id: &str) -> Option<String> {
     }
 }
 
+/// Stage 13: fetch the active agent profile revision for `adapter_id` from the
+/// control plane. Returns the system prompt text; on any error or when no
+/// active profile exists, falls back to the env-based [`agent_profile`] so the
+/// node keeps working without a configured profile server-side. The autonomy +
+/// resource limits from the profile are intentionally not applied here yet —
+/// wiring `AgentProfile.autonomy` into `cfg.autonomy` and `ResourceLimits` into
+/// `SpawnRequest.limits` is a follow-up; this lands the fetch path first.
+async fn fetch_agent_profile(
+    client: &reqwest::Client,
+    server: &str,
+    adapter_id: &str,
+) -> Option<String> {
+    let resp = client
+        .get(format!("{server}/v1/profiles/{}", adapter_id))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let revs: Vec<agentgrid_common::AgentProfile> = resp.json().await.ok()?;
+    revs.into_iter()
+        .find(|p| p.active)
+        .map(|p| p.system_prompt)
+        .filter(|s| !s.is_empty())
+}
+
 /// Stage 9.2: discover skills in the worktree + user home, keep only the ones
 /// the operator explicitly trusted on the control plane (fail-closed: an
 /// untrusted/unknown skill is omitted), and render a short "Available skills"
@@ -792,7 +819,11 @@ async fn drive_acp_session(
         cmd.env(k, v);
     }
     // Forward the agent profile as an env hint for agents that read it.
-    if let Some(text) = agent_profile(&assignment.adapter) {
+    // Stage 13: prefer the control-plane active profile; fall back to env.
+    let profile_text = fetch_agent_profile(client, &cfg.server, &assignment.adapter)
+        .await
+        .or_else(|| agent_profile(&assignment.adapter));
+    if let Some(text) = profile_text {
         cmd.env("AGENTGRID_SYSTEM_PROMPT", &text);
     }
     let mut child = cmd.spawn()?;
@@ -1088,7 +1119,10 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     // Agent profile (idea 6): an optional system prompt for this adapter,
     // projected into the worktree as AGENTS.md before the agent runs. Sourced
     // from AGENTGRID_AGENT_PROFILE_<ID> (a path to a .md file, or inline text).
-    if let Some(text) = agent_profile(&assignment.adapter) {
+    if let Some(text) = fetch_agent_profile(&client, &cfg.server, &assignment.adapter)
+        .await
+        .or_else(|| agent_profile(&assignment.adapter))
+    {
         let p = ws.path.join("AGENTS.md");
         let _ = tokio::fs::write(&p, &text).await;
     }
@@ -2246,6 +2280,63 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A dummy CP that always answers a fixed JSON profile list (Stage 13 fetch).
+    async fn dummy_profile_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_agent_profile_picks_active_revision() {
+        // Two revisions, the older marked active; fetch must return its prompt.
+        let body = r#"[
+            {"id":"claude","revision":2,"system_prompt":"new","autonomy":"l3","memory_max":null,"cpu_quota":null,"tasks_max":null,"created_at":"","created_by":null,"active":false},
+            {"id":"claude","revision":1,"system_prompt":"v1 active","autonomy":"l2","memory_max":null,"cpu_quota":null,"tasks_max":null,"created_at":"","created_by":null,"active":true}
+        ]"#;
+        let server = dummy_profile_server(body).await;
+        let client = reqwest::Client::new();
+        let prompt = fetch_agent_profile(&client, &server, "claude").await;
+        assert_eq!(prompt.as_deref(), Some("v1 active"));
+    }
+
+    #[tokio::test]
+    async fn fetch_agent_profile_none_when_no_active() {
+        // No active revision → None (caller falls back to env).
+        let body = r#"[
+            {"id":"claude","revision":1,"system_prompt":"x","autonomy":"l2","memory_max":null,"cpu_quota":null,"tasks_max":null,"created_at":"","created_by":null,"active":false}
+        ]"#;
+        let server = dummy_profile_server(body).await;
+        let client = reqwest::Client::new();
+        assert_eq!(fetch_agent_profile(&client, &server, "claude").await, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_agent_profile_none_on_empty_prompt() {
+        // An active revision with an empty prompt filters out (no env hint to set).
+        let body = r#"[
+            {"id":"claude","revision":1,"system_prompt":"","autonomy":"l2","memory_max":null,"cpu_quota":null,"tasks_max":null,"created_at":"","created_by":null,"active":true}
+        ]"#;
+        let server = dummy_profile_server(body).await;
+        let client = reqwest::Client::new();
+        assert_eq!(fetch_agent_profile(&client, &server, "claude").await, None);
     }
 
     #[tokio::test]

@@ -410,7 +410,7 @@
 ## Этап 13 — 0.5 Profiles, loop templates и advanced (по мере готовности)
 
 - [x] `AgentProfile`: desired-state для agents/skills/MCP/policies; иммутабельные ревизии + rollback — CP миграция `0021_agent_profiles` (immutable revisions + `agent_profiles_active` pointer), `AgentProfile`/`AgentProfileCreate`/`ActivateProfile` в common, эндпоинты `GET /v1/profiles`, `GET/POST /v1/profiles/{id}`, `POST /v1/profiles/{id}/activate`, audit `profile.create`/`profile.activate`. CLI `ag profiles list/show/create/activate`. Covered `agent_profile_revisions_immutable_and_roll_back`.
-- [ ] Синхронизация profiles на nodes: только secret references/requirements, никогда secret values; capability/version compatibility check до активации — [ ] node-side fetch profile from CP (сейчас env `AGENTGRID_AGENT_PROFILE_<ID>` как fallback), [ ] sync secret-refs + capability check.
+- [x] Синхронизация profiles на nodes: только secret references/requirements, никогда secret values; capability/version compatibility check до активации — [x] node-side fetch active profile из CP (`fetch_agent_profile` → `GET /v1/profiles/{id}`, выбирает active revision, fallback на env `AGENTGRID_AGENT_PROFILE_<ID>` если CP не ответил/нет профиля). Покрыто `fetch_agent_profile_*` (picks active, none-on-no-active, none-on-empty). [ ] secret-ref sync (только требования, никогда значения) + capability/version compatibility check до активации — follow-up (сейчас только system_prompt).
 - [ ] MCP profiles: stdio lifecycle per session, capability discovery, политика доступа
 - [ ] Loop Engineering: импорт workflow templates, budgets, circuit breakers
 - [ ] Scheduled/recurring workflows с autonomy limits (L4 только с policy и budget)
@@ -427,7 +427,7 @@
 
 - [ ] Каждый P0-баг закрывается с regression test
 - [ ] Каждая фича — через PR с зелёным CI (fmt/clippy/test/build/web/E2E)
-- [ ] ADR на каждое архитектурное решение (минимум: outcome model, ack, outbox, adapter registry, ACP north/south, skills trust, workflow DAG, Zeroshot ownership)
+- [x] ADR на каждое архитектурное решение (минимум: outcome model, ack, outbox, adapter registry, ACP north/south, skills trust, workflow DAG, Zeroshot ownership) — ADR 0001 (MVP scope, covers outcome model/ack/outbox/adapter registry), 0002 (Zeroshot ownership), 0003 (execution backends), 0004 (workflow DAG invariants). Skills trust + ACP north/south inlined в Stage docs (`docs/acp-interop.md`, threat-model) — follow-up: поднять до standalone ADR если требуется.
 - [ ] CHANGELOG и semver теги: `v0.1.1`, `v0.2.0`, `v0.3.0`, далее по этапам
 - [ ] Раз в неделю — ручной прогон happy path на двух реальных машинах; перед release — smoke на Linux/macOS/Windows
 - [ ] Держать resource budgets: node idle RSS ≤ 25 МБ, control plane idle ≤ 64 МБ, streaming ≤ 60 МБ; фиксировать OS/архитектуру, dataset и p50/p95, чтобы цифры были воспроизводимы

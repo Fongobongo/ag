@@ -1073,6 +1073,10 @@ async fn create_workflow(
             tracing::error!("workflow yaml parse failed: {e}");
             StatusCode::BAD_REQUEST
         })?;
+        t.validate_dag().map_err(|e| {
+            tracing::warn!("workflow DAG invalid: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
         CreateWorkflowRequest {
             name: t.name,
             steps: t.steps,
@@ -1084,6 +1088,20 @@ async fn create_workflow(
             StatusCode::BAD_REQUEST
         })?
     };
+    // Validate the graph (ADR 0004) on the JSON path too: YAML is checked above,
+    // JSON-built templates go through the same invariant so a malformed graph
+    // never reaches the scheduler.
+    WorkflowTemplate {
+        id: String::new(),
+        name: req.name.clone(),
+        steps: req.steps.clone(),
+        created_at: String::new(),
+    }
+    .validate_dag()
+    .map_err(|e| {
+        tracing::warn!("workflow DAG invalid: {e}");
+        StatusCode::BAD_REQUEST
+    })?;
     state
         .store
         .create_workflow_template(&req.name, &req.steps)

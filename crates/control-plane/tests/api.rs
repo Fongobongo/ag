@@ -1728,6 +1728,60 @@ async fn workflow_rejects_invalid_dag() {
 }
 
 #[tokio::test]
+async fn workflow_create_rejects_cycle_duplicate_self_dep() {
+    // ADR 0004: the DAG is validated at template-create time — a malformed
+    // graph never reaches the scheduler (loud fail, BAD_REQUEST).
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state);
+
+    // Direct cycle a -> b -> a.
+    let steps = json!([
+        {"id":"a","prompt":"x","depends_on":["b"]},
+        {"id":"b","prompt":"y","depends_on":["a"]}
+    ]);
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/workflows",
+            json!({"name":"cyc","steps":steps}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "cycle rejected");
+
+    // Duplicate ids.
+    let steps = json!([
+        {"id":"a","prompt":"x","depends_on":[]},
+        {"id":"a","prompt":"y","depends_on":[]}
+    ]);
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/workflows",
+            json!({"name":"dup","steps":steps}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "duplicate id rejected"
+    );
+
+    // Self-dependency.
+    let steps = json!([{"id":"a","prompt":"x","depends_on":["a"]}]);
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/workflows",
+            json!({"name":"self","steps":steps}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "self-dep rejected");
+}
+
+#[tokio::test]
 async fn workflow_golden_architect_workers_integrator_verifier() {
     // Exit 7: architect -> 2 parallel workers -> integrator -> verifier runs
     // locally; the durable scheduler activates ready steps as Agentgrid tasks

@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (node — profile fetch from CP + DAG validation, Stage 13 / ADR 0004)
+
+- Node now fetches the active agent profile revision from the control plane
+  (`fetch_agent_profile` → `GET /v1/profiles/{id}`) and prefers it over the
+  env-based `AGENTGRID_AGENT_PROFILE_<ID>` fallback. Any CP error / missing
+  active profile / empty prompt transparently falls back to the env, so the
+  node keeps working without a server-side profile. Covered by
+  `fetch_agent_profile_picks_active_revision`,
+  `fetch_agent_profile_none_when_no_active`,
+  `fetch_agent_profile_none_on_empty_prompt` (dummy CP servers).
+- **ADR 0004: Workflow DAG invariants** (`docs/decisions/0004-workflow-dag-invariants.md`):
+  the step graph is validated at template-create time — unique ids, no
+  self-dep, no orphan dep, acyclic — so a malformed graph never reaches the
+  scheduler (loud fail, BAD_REQUEST). `WorkflowTemplate::validate_dag` in
+  `agentgrid-common::workflow` (DFS colour-mark, O(V+E)); `POST /v1/workflows`
+  calls it on both the YAML and JSON paths. Covered by
+  `workflow::tests::validate_dag_*` and
+  `workflow_create_rejects_cycle_duplicate_self_dep` (CP integration).
+- Follow-up: wire the profile's `autonomy` + `ResourceLimits` into the node's
+  `SpawnRequest.limits`/`cfg.autonomy` (today only the system_prompt is read);
+  secret-reference sync + capability/version check before activation.
+
 ### Added (policy — external provider registration, Stage 9.1)
 
 - `ExternalPolicyProvider` in `agentgrid-common::policy`: shells out to a
