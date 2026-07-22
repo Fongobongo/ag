@@ -430,7 +430,7 @@
 - [x] ADR на каждое архитектурное решение (минимум: outcome model, ack, outbox, adapter registry, ACP north/south, skills trust, workflow DAG, Zeroshot ownership) — ADR 0001 (MVP scope, covers outcome model/ack/outbox/adapter registry), 0002 (Zeroshot ownership), 0003 (execution backends), 0004 (workflow DAG invariants). Skills trust + ACP north/south inlined в Stage docs (`docs/acp-interop.md`, threat-model) — follow-up: поднять до standalone ADR если требуется.
 - [ ] CHANGELOG и semver теги: `v0.1.1`, `v0.2.0`, `v0.3.0`, далее по этапам
 - [ ] Раз в неделю — ручной прогон happy path на двух реальных машинах; перед release — smoke на Linux/macOS/Windows
-- [ ] Держать resource budgets: node idle RSS ≤ 25 МБ, control plane idle ≤ 64 МБ, streaming ≤ 60 МБ; фиксировать OS/архитектуру, dataset и p50/p95, чтобы цифры были воспроизводимы
+- [~] Держать resource budgets: node idle RSS ≤ 25 МБ, control plane idle ≤ 64 МБ, streaming ≤ 60 МБ; фиксировать OS/архитектуру, dataset и p50/p95, чтобы цифры были воспроизводимы — `agentgrid_common::rss::current_rss()` зонд `/proc/self/status` VmRSS (Linux) + unit-тест парсинга. Инфраструктура измерения готова; [ ] измерения в CI (p50/p95, OS/arch) — follow-up (требует bench harness + фиксацию env).
 - [ ] CI matrix: Linux x86_64/aarch64, macOS arm64/x86_64 (где доступно), Windows x86_64; platform-specific tests не маскировать общим `allow_failure`
 - [ ] Release artifacts: checksums, SBOM, подпись/attestation, pinned toolchain и dependency audit
 - [ ] Миграции БД: forward-only в пределах релиза + backup/restore rehearsal; rolling N/N-1 только там, где заявлено
@@ -503,10 +503,10 @@
 - [ ] Секрет в stdout/stderr/validation output → замаскирован во всех путях, включая fallback и artifacts
 - [ ] `agent-raw-output.log` не попадает в git-коммит и в patch
 - [x] Artifact name `../../etc/passwd` → отклонён, запись только внутри artifact root
-- [ ] Repo slug/branch/URL с shell-метасимволами → нет выполнения произвольных команд
-- [ ] Task для adapter B на node с default A → запускается именно B или честный reject
+- [x] Repo slug/branch/URL с shell-метасимволами → нет выполнения произвольных команд — покрыто `rejects_injection_in_repo_branch_or_url` (+ `validate_token`/`validate_git_url`, git args без shell).
+- [x] Task для adapter B на node с default A → запускается именно B или честный reject — покрыто `scheduler_skips_incompatible_head_of_line` + `task_eligibility` missing-adapter reason (task остаётся queued).
 - [ ] Два параллельных attempt одного репо → оба завершаются корректно без гонок Git
-- [ ] Node offline с running attempt → attempt помечен `lost`, задача обработана по policy
+- [x] Node offline с running attempt → attempt помечен `lost`, задача обработана по policy — покрыто `node_offline_loses_attempt_then_retry_succeeds` + `complete_on_lost_attempt_is_idempotent`.
 
 ### Failure injection (расширяется с каждым этапом)
 

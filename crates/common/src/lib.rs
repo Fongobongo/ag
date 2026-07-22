@@ -69,6 +69,7 @@ pub mod approval;
 pub mod cluster;
 pub mod context;
 pub mod profile;
+pub mod rss;
 pub mod skills_trust;
 mod state_machine;
 

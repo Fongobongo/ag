@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (common — RSS budget probe, audit 22.1.1)
+
+- `agentgrid_common::rss::current_rss()` reads `/proc/self/status` `VmRSS:`
+  and returns the resident set size in bytes (Linux only; `None` elsewhere
+  or on read error) so budget checks (node idle ≤ 25 MB, control plane idle
+  ≤ 64 MB, streaming ≤ 60 MB) have a single probe to call without platform
+  gating. Covered by `parses_vmrss_line` + `current_rss_returns_something_on_linux`.
+- Regression-test backlog audit (22.1.1): confirmed and ticked the three
+  already-covered scenarios — repo/branch/URL shell-metachar injection
+  (`rejects_injection_in_repo_branch_or_url`), adapter-mismatch task stays
+  queued (`scheduler_skips_incompatible_head_of_line` + `task_eligibility`),
+  and node-offline marks attempts `lost` + task `failed/node_lost`
+  (`node_offline_loses_attempt_then_retry_succeeds`,
+  `complete_on_lost_attempt_is_idempotent`).
+
 ### Added (node — apply profile autonomy + resource limits, Stage 13)
 
 - The node now applies the active agent profile's autonomy and resource
