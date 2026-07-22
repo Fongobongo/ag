@@ -4,9 +4,9 @@
 //! exercises the same `/v1` surface.
 
 use agentgrid_common::{
-    ApprovalView, CreateTaskRequest, CreateWorkflowRequest, CreateWorkflowRunRequest, LoginRequest,
-    LoginResponse, SkillTrustView, TaskEligibility, TaskStatus, TaskView, WorkflowStep,
-    WorkflowTemplate,
+    AgentProfile, ApprovalView, CreateTaskRequest, CreateWorkflowRequest, CreateWorkflowRunRequest,
+    LoginRequest, LoginResponse, SkillTrustView, TaskEligibility, TaskStatus, TaskView,
+    WorkflowStep, WorkflowTemplate,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -53,6 +53,8 @@ enum AgCommand {
     Approvals(ApprovalArgs),
     /// Manage skill trust decisions (fail-closed: untrusted until trusted).
     Skills(SkillsArgs),
+    /// Manage agent profiles (system prompt + autonomy + limits; immutable revisions).
+    Profiles(ProfilesArgs),
     /// Start the control plane (standalone binary).
     Server(ServerStartArgs),
     /// Define and run Agentgrid workflows (DAGs of agent steps).
@@ -183,6 +185,44 @@ struct SkillsNameArgs {
     /// Where the skill was found: project|user|managed (default project).
     #[arg(long, default_value = "project")]
     source: String,
+}
+
+#[derive(Args)]
+struct ProfilesArgs {
+    #[command(subcommand)]
+    action: ProfilesAction,
+}
+
+#[derive(Subcommand)]
+enum ProfilesAction {
+    /// List profile ids that have an active revision.
+    List,
+    /// Show all revisions of a profile (newest first).
+    Show { id: String },
+    /// Create a new revision of a profile (does not activate it).
+    Create(ProfileCreateArgs),
+    /// Activate a specific revision (rollback = activate an older one).
+    Activate { id: String, revision: i64 },
+}
+
+#[derive(Args)]
+struct ProfileCreateArgs {
+    id: String,
+    /// System prompt text (inline). Empty string allowed.
+    #[arg(long, default_value = "")]
+    system_prompt: String,
+    /// Autonomy level: l0|l1|l2|l3|l4 (default l2).
+    #[arg(long, default_value = "l2")]
+    autonomy: String,
+    /// Max RSS in bytes.
+    #[arg(long)]
+    memory_max: Option<i64>,
+    /// CPU quota, percent of one core (200 = 2 cores).
+    #[arg(long)]
+    cpu_quota: Option<i64>,
+    /// Max tasks (PIDs).
+    #[arg(long)]
+    tasks_max: Option<i64>,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +402,7 @@ async fn main() -> Result<()> {
         AgCommand::Login(a) => cmd_login(&client, &base, a).await,
         AgCommand::Approvals(a) => cmd_approvals(&client, &base, a).await,
         AgCommand::Skills(a) => cmd_skills(&client, &base, a).await,
+        AgCommand::Profiles(a) => cmd_profiles(&client, &base, a).await,
         AgCommand::Server(a) => cmd_server_start(a),
         AgCommand::Workflow(a) => cmd_workflow(&client, &base, a, cli.json).await,
     }
@@ -946,6 +987,101 @@ async fn set_skill_trust(
         Ok(())
     } else {
         anyhow::bail!("skill {decision} failed ({})", resp.status())
+    }
+}
+
+/// Stage 13: agent profile management. Revisions are immutable; activating an
+/// older revision rolls back without losing history.
+async fn cmd_profiles(client: &reqwest::Client, base: &str, a: ProfilesArgs) -> Result<()> {
+    match a.action {
+        ProfilesAction::List => {
+            let resp = client
+                .get(format!("{base}/v1/profiles"))
+                .send()
+                .await
+                .context("profiles list request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("profiles list failed ({})", resp.status());
+            }
+            let ids: Vec<String> = resp.json().await.context("bad profiles json")?;
+            if ids.is_empty() {
+                println!("no active profiles");
+            }
+            for id in &ids {
+                println!("{id}");
+            }
+            Ok(())
+        }
+        ProfilesAction::Show { id } => {
+            let resp = client
+                .get(format!("{base}/v1/profiles/{id}"))
+                .send()
+                .await
+                .context("profile show request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("profile show failed ({})", resp.status());
+            }
+            let revs: Vec<AgentProfile> = resp.json().await.context("bad profile json")?;
+            if revs.is_empty() {
+                println!("profile {id}: no revisions");
+            }
+            for p in &revs {
+                println!(
+                    "{:<8}{:<2} {:<8} mem={:?} cpu={:?} tasks={:?} {}",
+                    format!("r{}", p.revision),
+                    if p.active { "*" } else { " " },
+                    p.autonomy,
+                    p.memory_max.map(|v| v.to_string()),
+                    p.cpu_quota.map(|v| v.to_string()),
+                    p.tasks_max.map(|v| v.to_string()),
+                    if p.system_prompt.is_empty() {
+                        ""
+                    } else {
+                        "<prompt>"
+                    },
+                );
+            }
+            Ok(())
+        }
+        ProfilesAction::Create(a) => {
+            let id = a.id.clone();
+            let body = serde_json::json!({
+                "system_prompt": a.system_prompt,
+                "autonomy": a.autonomy,
+                "memory_max": a.memory_max,
+                "cpu_quota": a.cpu_quota,
+                "tasks_max": a.tasks_max,
+            });
+            let resp = client
+                .post(format!("{base}/v1/profiles/{}", a.id))
+                .json(&body)
+                .send()
+                .await
+                .context("profile create request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("profile create failed ({})", resp.status());
+            }
+            let v: serde_json::Value = resp.json().await.context("bad profile json")?;
+            println!(
+                "created {id}/r{} (not active; `ag profiles activate {id} <rev>`)",
+                v["revision"]
+            );
+            Ok(())
+        }
+        ProfilesAction::Activate { id, revision } => {
+            let resp = client
+                .post(format!("{base}/v1/profiles/{id}/activate"))
+                .json(&serde_json::json!({ "revision": revision }))
+                .send()
+                .await
+                .context("profile activate request failed")?;
+            if resp.status().is_success() {
+                println!("activated {id}/r{revision}");
+                Ok(())
+            } else {
+                anyhow::bail!("profile activate failed ({})", resp.status())
+            }
+        }
     }
 }
 

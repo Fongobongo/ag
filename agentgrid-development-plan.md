@@ -408,8 +408,8 @@
 
 ## Этап 13 — 0.5 Profiles, loop templates и advanced (по мере готовности)
 
-- [ ] `AgentProfile`: desired-state для agents/skills/MCP/policies; иммутабельные ревизии + rollback
-- [ ] Синхронизация profiles на nodes: только secret references/requirements, никогда secret values; capability/version compatibility check до активации
+- [x] `AgentProfile`: desired-state для agents/skills/MCP/policies; иммутабельные ревизии + rollback — CP миграция `0021_agent_profiles` (immutable revisions + `agent_profiles_active` pointer), `AgentProfile`/`AgentProfileCreate`/`ActivateProfile` в common, эндпоинты `GET /v1/profiles`, `GET/POST /v1/profiles/{id}`, `POST /v1/profiles/{id}/activate`, audit `profile.create`/`profile.activate`. CLI `ag profiles list/show/create/activate`. Covered `agent_profile_revisions_immutable_and_roll_back`.
+- [ ] Синхронизация profiles на nodes: только secret references/requirements, никогда secret values; capability/version compatibility check до активации — [ ] node-side fetch profile from CP (сейчас env `AGENTGRID_AGENT_PROFILE_<ID>` как fallback), [ ] sync secret-refs + capability check.
 - [ ] MCP profiles: stdio lifecycle per session, capability discovery, политика доступа
 - [ ] Loop Engineering: импорт workflow templates, budgets, circuit breakers
 - [ ] Scheduled/recurring workflows с autonomy limits (L4 только с policy и budget)

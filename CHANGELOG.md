@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (profiles — immutable revisions + rollback, Stage 13)
+
+- Agent profile desired-state ledger (migration `0021_agent_profiles`): a
+  profile is a chain of **immutable revisions** (system prompt + autonomy +
+  resource limits); an `agent_profiles_active` pointer selects the live one,
+  so **rollback = activate an older revision** without losing history. Endpoints:
+  `GET /v1/profiles` (active ids), `GET /v1/profiles/{id}` (all revisions),
+  `POST /v1/profiles/{id}` (new revision, not auto-activated),
+  `POST /v1/profiles/{id}/activate` (flip the pointer). Every create/activate
+  is audited (`profile.create`/`profile.activate`). `AgentProfile`/
+  `AgentProfileCreate`/`ActivateProfile` live in `agentgrid-common`.
+- CLI: `ag profiles list`, `show <id>`, `create <id> [--system-prompt …] [--autonomy l2] [--memory-max N] [--cpu-quota N] [--tasks-max N]`, `activate <id> <rev>`.
+- Covered by `agent_profile_revisions_immutable_and_roll_back` (CP integration).
+- Follow-up: node-side fetch of the active profile from the CP (today the node
+  still reads `AGENTGRID_AGENT_PROFILE_<ID>` from env), secret-reference sync
+  (carries requirements, never values), capability/version compatibility check
+  before activation.
+
 ### Added (backends — resource limits + error mapping, Stage 12)
 
 - `ExecutionBackend` contract extended (in `agentgrid-adapters::backend`):

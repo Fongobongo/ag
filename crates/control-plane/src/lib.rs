@@ -269,6 +269,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/skills/{name}", get(get_skill_trust_handler))
         .route("/v1/skills/{name}/trust", post(trust_skill_handler))
         .route("/v1/skills/{name}/untrust", post(untrust_skill_handler))
+        .route("/v1/profiles", get(list_profiles_handler))
+        .route("/v1/profiles/{id}", get(get_profile_handler))
+        .route("/v1/profiles/{id}", post(create_profile_handler))
+        .route("/v1/profiles/{id}/activate", post(activate_profile_handler))
         .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
@@ -706,6 +710,90 @@ async fn set_skill_trust(
             "skill.trust",
             Some(&format!("{name}/{source}")),
             Some(if trusted { "trusted" } else { "untrusted" }),
+        )
+        .await;
+    StatusCode::OK
+}
+
+// ---- Agent profiles (Stage 13) ----
+
+async fn list_profiles_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    state.store.list_profiles().await.map(Json).map_err(|e| {
+        tracing::error!("list_profiles failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn get_profile_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<agentgrid_common::AgentProfile>>, StatusCode> {
+    state
+        .store
+        .list_profile_revisions(&id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("get_profile failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn create_profile_handler(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthedUser>>,
+    Path(id): Path<String>,
+    Json(body): Json<agentgrid_common::AgentProfileCreate>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let actor = auth
+        .as_ref()
+        .map(|e| e.0.username.as_str())
+        .unwrap_or("system");
+    match state.store.create_profile_revision(&id, &body, actor).await {
+        Ok(rev) => {
+            let _ = state
+                .store
+                .audit(
+                    actor,
+                    None,
+                    "profile.create",
+                    Some(&format!("{id}/{rev}")),
+                    None,
+                )
+                .await;
+            Ok(Json(serde_json::json!({ "id": id, "revision": rev })))
+        }
+        Err(e) => {
+            tracing::error!("create_profile failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn activate_profile_handler(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthedUser>>,
+    Path(id): Path<String>,
+    Json(body): Json<agentgrid_common::ActivateProfile>,
+) -> StatusCode {
+    let actor = auth
+        .as_ref()
+        .map(|e| e.0.username.as_str())
+        .unwrap_or("system");
+    if let Err(e) = state.store.activate_profile(&id, body.revision).await {
+        tracing::error!("activate_profile failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    let _ = state
+        .store
+        .audit(
+            actor,
+            None,
+            "profile.activate",
+            Some(&format!("{id}/{}", body.revision)),
+            None,
         )
         .await;
     StatusCode::OK

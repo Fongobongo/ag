@@ -2491,3 +2491,157 @@ async fn skill_trust_defaults_untrusted_then_round_trips() {
         "decision was recorded even when untrusted"
     );
 }
+
+#[tokio::test]
+async fn agent_profile_revisions_immutable_and_roll_back() {
+    // Stage 13: a profile is a chain of immutable revisions; activating an
+    // older revision rolls back without losing history.
+    use agentgrid_common::{ActivateProfile, AgentProfileCreate};
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state.clone());
+
+    // List empty.
+    let list: Vec<String> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/profiles"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(list.is_empty());
+
+    // Create two revisions.
+    let r1: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(post_json(
+                    "/v1/profiles/claude",
+                    serde_json::to_string(&AgentProfileCreate {
+                        system_prompt: "v1 prompt".into(),
+                        autonomy: "l1".into(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                    None,
+                ))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let r1_rev = r1["revision"].as_i64().unwrap();
+    let r2: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(post_json(
+                    "/v1/profiles/claude",
+                    serde_json::to_string(&AgentProfileCreate {
+                        system_prompt: "v2 prompt".into(),
+                        autonomy: "l3".into(),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                    None,
+                ))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let r2_rev = r2["revision"].as_i64().unwrap();
+    assert_eq!(r2_rev, r1_rev + 1, "revisions monotonically increase");
+
+    // Activate the newer, then roll back to the older.
+    let _ = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/profiles/claude/activate",
+            serde_json::to_string(&ActivateProfile { revision: r2_rev }).unwrap(),
+            None,
+        ))
+        .await
+        .unwrap();
+    let revs: Vec<agentgrid_common::AgentProfile> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/profiles/claude"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revs.len(), 2, "both revisions kept (immutable history)");
+    assert!(
+        revs.iter().any(|p| p.revision == r2_rev && p.active),
+        "r2 active"
+    );
+    assert!(
+        revs.iter().any(|p| p.revision == r1_rev && !p.active),
+        "r1 inactive"
+    );
+
+    // Roll back.
+    let _ = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/profiles/claude/activate",
+            serde_json::to_string(&ActivateProfile { revision: r1_rev }).unwrap(),
+            None,
+        ))
+        .await
+        .unwrap();
+    let revs: Vec<agentgrid_common::AgentProfile> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/profiles/claude"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        revs.iter().any(|p| p.revision == r1_rev && p.active),
+        "r1 active after rollback"
+    );
+    let v1 = revs.iter().find(|p| p.revision == r1_rev).unwrap();
+    assert_eq!(v1.system_prompt, "v1 prompt");
+    assert_eq!(v1.autonomy, "l1");
+
+    // Profile id now in active list.
+    let list: Vec<String> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/profiles"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(list, vec!["claude".to_string()]);
+}
