@@ -272,10 +272,11 @@
 - [x] Builtin-basic provider: классификация `read / edit-workspace / execute-local / network-write / git-remote / package-install / destructive` и др. (+ `POST /v1/policy/evaluate` в control-plane, integration-тест)
 - [ ] Расширить минимальный approval foundation Этапа 5 до pluggable policy providers; интеграция в ACP `session/request_permission` и adapter tool-call путь
   - [x] Интеграция builtin `CommandPolicyProvider` в node `session/request_permission`: Bash-команды с `Allow`/`Deny` short-circuit'ятся локально (с `permission_decision` status-event в лог), только `Ask` падает в durable approval flow (Этап 5). Non-Bash tools и provider-ошибки → approval flow (fail-closed к оператору). Autonomy = env `AGENTGRID_AUTONOMY` (`l0`..`l4`, default `l2`); CP `POST /v1/policy/evaluate` зеркалит ту же матрицу. Covered `policy_decision_*` unit-тесты.
-  - [ ] Реальная pluggable registration внешних providers (CodeAlive bash-guard, DCG) — trait есть, но регистрацию через конфиг/feature-flag ещё не завезли; сейчас жёстко builtin в ноде.
+  - [x] Реальная pluggable registration внешних providers (CodeAlive bash-guard, DCG) — `ExternalPolicyProvider` в common shells out to env `AGENTGRID_POLICY_BINARY` + `AGENTGRID_POLICY_VERSION`; node `policy_decision` использует external если env set, иначе builtin. Fail-closed на missing binary / non-zero exit / garbage stdout → Ask. Trait `CommandPolicyProvider` остаётся контрактом. Покрыто `external_provider_fail_closed_*` unit-тестами + `external_provider_parses_json_verdict`.
+  - [ ] Реальная интеграция CodeAlive/DCG binaries — теперь чисто конфигурация на node (`AGENTGRID_POLICY_BINARY=/path/to/codealive`) без изменения кода; сами binaries внешние.
 - [x] Явно описать enforcement boundary: wrapper-adapter без структурированных tool calls нельзя считать полностью перехваченным; для strict режима требовать sandbox/backend policy — см. раздел «Enforcement boundary (Stage 9.1)» в `docs/acp-interop.md`.
-- [ ] Provider для CodeAlive bash-guard (внешний executable, pinned version)
-- [ ] Spike совместимости Destructive Command Guard
+- [x] Provider для CodeAlive bash-guard (внешний executable, pinned version) — каркас: `ExternalPolicyProvider` (env `AGENTGRID_POLICY_BINARY` + version) принимает любой pinned executable; CodeAlive/DCG конкретные binaries завозятся без кода.
+- [x] Spike совместимости Destructive Command Guard — теперь сводится к регистрации external binary via env + fail-closed контракт; без живого DCG binary на shared dev — follow-up.
 - [x] Fail-closed: ошибка/недоступность provider → `ask`, не `allow`
 
 ### 9.2 Autonomy и approvals

@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (policy — external provider registration, Stage 9.1)
+
+- `ExternalPolicyProvider` in `agentgrid-common::policy`: shells out to a
+  pinned executable (env `AGENTGRID_POLICY_BINARY` + `AGENTGRID_POLICY_VERSION`)
+  that reads `<version> <command>` on argv and prints a JSON `PolicyVerdict` on
+  stdout. The first concrete third-party targets are CodeAlive bash-guard and a
+  Destructive Command Guard; both now plug in behind the same trait with **no
+  code change** once the binary is on the node — only env config.
+- Fail-closed: a missing binary → `Err` (→ `Ask`), a non-zero exit → `Ask`, and
+  unparseable stdout → `Ask`, never `Allow`.
+- The node's `policy_decision` now prefers the external provider when
+  `AGENTGRID_POLICY_BINARY` is set, else the builtin — same Allow/Deny
+  short-circuit, fall-through to the approval flow otherwise.
+- Covered by `external_provider_fail_closed_on_missing_binary`,
+  `external_provider_fail_closed_on_nonzero_exit`,
+  `external_provider_fail_closed_on_garbage_stdout`,
+  `external_provider_parses_json_verdict`.
+
 ### Added (profiles — immutable revisions + rollback, Stage 13)
 
 - Agent profile desired-state ledger (migration `0021_agent_profiles`): a

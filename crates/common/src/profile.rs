@@ -60,8 +60,7 @@ mod tests {
     fn create_defaults_to_l2_when_deserialized() {
         // serde defaults (the L2 autonomy, empty prompt) apply when fields are
         // absent from JSON — the path the CP handler takes.
-        let c: AgentProfileCreate =
-            serde_json::from_str("{}").unwrap();
+        let c: AgentProfileCreate = serde_json::from_str("{}").unwrap();
         assert_eq!(c.autonomy, "l2");
         assert!(c.system_prompt.is_empty());
         assert!(c.memory_max.is_none());

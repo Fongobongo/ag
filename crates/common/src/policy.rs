@@ -94,6 +94,54 @@ pub trait CommandPolicyProvider: Send + Sync {
     fn evaluate(&self, command: &str, cwd: &str) -> Result<PolicyVerdict, PolicyError>;
 }
 
+/// Stage 9.1: an external command-policy provider — shells out to a pinned
+/// executable (e.g. CodeAlive bash-guard, Destructive Command Guard) that
+/// reads a command + autonomy on argv and prints a JSON `PolicyVerdict` on
+/// stdout. The builtin is the fallback when no external binary is configured.
+///
+/// Fail-closed: if the binary is missing, errors, or returns unparseable JSON,
+/// the verdict is `Ask` (operator approval), never `Allow`.
+///
+/// `ponytail:` one process per command (no long-lived daemon); suitable for a
+/// low rate of permission requests. A persistent daemon protocol is a
+/// follow-up if throughput matters.
+pub struct ExternalPolicyProvider {
+    pub binary: String,
+    pub version: String,
+}
+
+impl ExternalPolicyProvider {
+    pub fn new(binary: impl Into<String>, version: impl Into<String>) -> Self {
+        ExternalPolicyProvider {
+            binary: binary.into(),
+            version: version.into(),
+        }
+    }
+}
+
+impl CommandPolicyProvider for ExternalPolicyProvider {
+    fn evaluate(&self, command: &str, _cwd: &str) -> Result<PolicyVerdict, PolicyError> {
+        use std::process::Command;
+        let out = Command::new(&self.binary)
+            .arg(&self.version)
+            .arg(command)
+            .output()
+            .map_err(|e| PolicyError(format!("external policy binary failed: {e}")))?;
+        if !out.status.success() {
+            return Ok(PolicyVerdict::fail_closed(&format!(
+                "external policy exited {}",
+                out.status.code().unwrap_or(-1)
+            )));
+        }
+        match serde_json::from_slice::<PolicyVerdict>(&out.stdout) {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(PolicyVerdict::fail_closed(&format!(
+                "external policy unparseable output: {e}"
+            ))),
+        }
+    }
+}
+
 /// Heuristic builtin provider (Stage 9 foundation).
 pub struct BuiltinPolicyProvider;
 
@@ -506,5 +554,47 @@ mod tests {
                 .decision,
             PolicyDecision::Allow
         );
+    }
+
+    #[test]
+    fn external_provider_fail_closed_on_missing_binary() {
+        use super::ExternalPolicyProvider;
+        let p = ExternalPolicyProvider::new("/no/such/policy-binary", "0.1");
+        // A missing binary is an Err — the caller (policy_decision) maps it to
+        // Ask via .ok()?, never a silent Allow.
+        let e = p.evaluate("rm -rf /", "/w").unwrap_err();
+        assert!(e.0.contains("external policy binary failed"));
+    }
+
+    #[test]
+    fn external_provider_fail_closed_on_nonzero_exit() {
+        use super::ExternalPolicyProvider;
+        // `false` exits 1 — a non-success exit must fail-closed to Ask.
+        let p = ExternalPolicyProvider::new("false", "0.1");
+        let v = p.evaluate("rm -rf /", "/w").unwrap();
+        assert_eq!(v.decision, PolicyDecision::Ask);
+        assert!(v.reason.contains("exited"));
+    }
+
+    #[test]
+    fn external_provider_fail_closed_on_garbage_stdout() {
+        use super::ExternalPolicyProvider;
+        // `true` prints nothing — empty stdout is not valid PolicyVerdict JSON.
+        let p = ExternalPolicyProvider::new("true", "0.1");
+        let v = p.evaluate("rm -rf /", "/w").unwrap();
+        assert_eq!(v.decision, PolicyDecision::Ask);
+        assert!(v.reason.contains("unparseable"));
+    }
+
+    #[test]
+    fn external_provider_parses_json_verdict() {
+        // A well-formed JSON verdict the external binary would print is parsed
+        // back into a PolicyVerdict (the path ExternalPolicyProvider.evaluate
+        // takes on success).
+        let json = r#"{"decision":"deny","risk_class":"destructive","reason":"x","matched_rules":["ext:deny"]}"#;
+        let v: PolicyVerdict = serde_json::from_str(json).unwrap();
+        assert_eq!(v.decision, PolicyDecision::Deny);
+        assert_eq!(v.risk_class, RiskClass::Destructive);
+        assert_eq!(v.matched_rules, vec!["ext:deny"]);
     }
 }

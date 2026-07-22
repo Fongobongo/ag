@@ -15,7 +15,7 @@ use agentgrid_acp::{
 };
 use agentgrid_adapters::{to_event_type, AdapterEvent, ExecutionBackend};
 use agentgrid_common::{
-    policy::{AutonomyLevel, BuiltinPolicyProvider, PolicyDecision},
+    policy::{AutonomyLevel, BuiltinPolicyProvider, CommandPolicyProvider, PolicyDecision},
     AdapterCapability, AgentEventEnvelope, ApprovalStatus, ApprovalView, Assignment, CancelState,
     CompleteAttemptRequest, ContextProvider, CreateAgentSessionRequest, EnrollRequest,
     EnrollResponse, EventKind, EventType, HeartbeatRequest, IncomingEvent, IngestEventsRequest,
@@ -1035,9 +1035,19 @@ fn policy_decision(
         return None;
     }
     let cmd = permission.get("input").and_then(|v| v.as_str())?;
-    let verdict = BuiltinPolicyProvider::new()
-        .evaluate_with(autonomy, cmd, "")
-        .ok()?;
+    // Stage 9.1: an external provider (CodeAlive bash-guard / DCG) takes
+    // precedence when AGENTGRID_POLICY_BINARY is set; otherwise the builtin.
+    // Both are fail-closed to `Ask` on error → falls through to approval flow.
+    let verdict = match std::env::var("AGENTGRID_POLICY_BINARY") {
+        Ok(bin) => {
+            let version = std::env::var("AGENTGRID_POLICY_VERSION").unwrap_or_default();
+            let p = agentgrid_common::policy::ExternalPolicyProvider::new(bin, version);
+            p.evaluate(cmd, "").ok()?
+        }
+        Err(_) => BuiltinPolicyProvider::new()
+            .evaluate_with(autonomy, cmd, "")
+            .ok()?,
+    };
     // `Ask` is not a local decision: fall through to the operator approval flow.
     if verdict.decision == PolicyDecision::Ask {
         return None;
