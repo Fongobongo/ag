@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (node — skill discovery wired into the prompt, Stage 9.2)
+
+- The node daemon now discovers skills in the attempt worktree
+  (`<worktree>/.agents/skills`) and the user home (`~/.agents/skills`) before
+  `session_prompt`, and appends an "Available agent skills (operator-trusted)"
+  block to the prompt — but **only for skills the operator explicitly trusted**
+  on the control plane (`GET /v1/skills`). Untrusted / unknown skills are omitted
+  (fail-closed); any trust-ledger fetch error yields an empty block, so the task
+  is never blocked by the skills wiring (skills are a hint, not a hard
+  dependency). This closes the trust loop: the ledger (`POST
+  /v1/skills/{name}/trust`) the operator edits is enforced at prompt-composition
+  time on the node.
+- The node-daemon now depends on `agentgrid-skills` (previously unused by any
+  binary); `discover` + `standard_roots` are reused verbatim.
+- Covered by `render_trusted_skills_block_filters_and_sorts` (pure render).
+  Heartbeat-side skill reporting (so the operator sees discovered-but-untrusted
+  skills in the UI automatically) and hard load/execute enforcement against an
+  agent that reads `SKILL.md` itself remain follow-ups.
+
 ### Added (skills — trust ledger UI/CLI, Stage 9.2)
 
 - New control-plane skill-trust ledger (migration `0020_skill_trust`):

@@ -104,6 +104,7 @@ dependencies = [
  "agentgrid-acp",
  "agentgrid-adapters",
  "agentgrid-common",
+ "agentgrid-skills",
  "anyhow",
  "libc",
  "reqwest",

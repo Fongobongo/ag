@@ -291,7 +291,8 @@
   - [x] CP хранение trust-решений: миграция `0020_skill_trust`, `SkillTrustView` в common, методы store `set/get/list_skill_trust`. Эндпоинты `GET /v1/skills[?source=]`, `GET /v1/skills/{name}?source=`, `POST /v1/skills/{name}/trust|untrust?source=`. Каждое решение → audit `skill.trust`. Покрыто `skill_trust_defaults_untrusted_then_round_trips`.
   - [x] CLI `ag skills list [--source]` / `trust <name> [--source]` / `untrust <name> [--source]`.
   - [x] Web UI раздела Skills (`#/skills`): таблица доверия (✅/⛔), кнопка Trust/Untrust с confirm, автополл 5 s. Fail-closed плашка: ненайденный skill = untrusted.
-  - [ ] Wiring: node-сайд discovery (heartbeat report discovered skills + CP отвечает trust-verdict) + реальное enforcement (блок load/execute untrusted skill на ноде) — отдельный этап; пока trust-ledger и UI/CLI готовы, потребление на ноде ещё не подключено.
+  - [x] Wiring: node-сайд discovery — `compose_skills_block` в `drive_acp_session` перед `session_prompt`: discover навыков из worktree `.agents/skills` + `~/.agents/skills` (skills crate `standard_roots`/`discover`), fetch CP trust-ledger (`GET /v1/skills`), filter только trusted, append «Available agent skills» block в промпт. Fail-closed: untrusted/ошибка → блок пустой (skill не подсказан, задача не блокируется). Pure `render_trusted_skills_block` unit-проверен.
+  - [ ] Реальное enforcement на load/execute (блок входящего в агент untrusted skill, если агент сам читает `SKILL.md`) — не сейчас; только промпт-инъекция trusted catalog. Heartbeat-report discovered skills для автозаполнения таблицы — follow-up.
 - [x] Timeout неотвеченного approval → step `blocked`, не висящий run
 - [x] Tests: malicious `SKILL.md`, destructive command fixture → deny/ask; secrets не в approval payload
 

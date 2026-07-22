@@ -300,6 +300,71 @@ fn agent_profile(adapter_id: &str) -> Option<String> {
     }
 }
 
+/// Stage 9.2: discover skills in the worktree + user home, keep only the ones
+/// the operator explicitly trusted on the control plane (fail-closed: an
+/// untrusted/unknown skill is omitted), and render a short "Available skills"
+/// block to append to the prompt. Returns an empty string on any error so the
+/// task is never blocked by the trust lookup wiring (the skills are a hint, not
+/// a hard dependency).
+///
+/// `ponytail:` fetches the whole trust ledger per attempt (O(skills) over HTTP,
+/// small); if skill counts grow, switch to a per-skill lookup or a node-side
+/// cache keyed by `(name, source)`.
+async fn compose_skills_block(
+    client: &reqwest::Client,
+    server: &str,
+    ws_path: &std::path::Path,
+) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let roots = agentgrid_skills::standard_roots(ws_path, home.as_deref());
+    let (discovered, _diags) = agentgrid_skills::discover(&roots);
+    if discovered.is_empty() {
+        return String::new();
+    }
+    // Fetch the full trust ledger; untrusted/absent entries are dropped.
+    let trusted_name: std::collections::HashSet<(String, String)> =
+        match client.get(format!("{server}/v1/skills")).send().await {
+            Ok(r) if r.status().is_success() => {
+                match r.json::<Vec<agentgrid_common::SkillTrustView>>().await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .filter(|v| v.trusted)
+                        .map(|v| (v.name, v.source))
+                        .collect(),
+                    Err(_) => return String::new(),
+                }
+            }
+            _ => return String::new(), // skills are a hint; don't block the task
+        };
+    render_trusted_skills_block(&discovered, &trusted_name)
+}
+
+/// Pure render of the trusted subset of discovered skills. Separated so it can
+/// be unit-tested without HTTP.
+fn render_trusted_skills_block(
+    discovered: &[agentgrid_skills::DiscoveredSkill],
+    trusted: &std::collections::HashSet<(String, String)>,
+) -> String {
+    let mut keep: Vec<&agentgrid_skills::DiscoveredSkill> = discovered
+        .iter()
+        .filter(|d| trusted.contains(&(d.skill.name.clone(), d.source.as_str().to_string())))
+        .collect();
+    if keep.is_empty() {
+        return String::new();
+    }
+    keep.sort_by(|a, b| a.skill.name.cmp(&b.skill.name));
+    let mut out = String::from("\n\nAvailable agent skills (operator-trusted):\n");
+    for d in keep {
+        out.push_str(&format!(
+            "- {} ({}): {}\n",
+            d.skill.name,
+            d.source.as_str(),
+            d.skill.description.lines().next().unwrap_or("").trim(),
+        ));
+    }
+    out
+}
+
 async fn probe_adapter(bin: &str) -> AdapterProbe {
     if resolve_in_path(bin).is_none() {
         return AdapterProbe {
@@ -773,7 +838,10 @@ async fn drive_acp_session(
     });
 
     let acp3 = acp.clone();
-    let prompt_text = assignment.prompt.clone();
+    let mut prompt_text = assignment.prompt.clone();
+    // Stage 9.2: append the operator-trusted skills discovered in this worktree
+    // (fail-closed: untrusted skills are omitted, any lookup error = no block).
+    prompt_text.push_str(&compose_skills_block(client, &cfg.server, ws_path).await);
     let sid_prompt = session_id.clone();
     let mut prompt = tokio::spawn(async move {
         acp3.session_prompt(SessionPromptParams {
@@ -1906,6 +1974,52 @@ mod tests {
             policy_decision(&json!({ "tool": "Bash" }), AutonomyLevel::L4),
             None,
             "missing input → no short-circuit"
+        );
+    }
+
+    /// Stage 9.2: only trusted `(name, source)` skills are listed, sorted by
+    /// name; untrusted/absent entries are omitted; an empty trusted set yields
+    /// an empty block (fail-closed).
+    #[test]
+    fn render_trusted_skills_block_filters_and_sorts() {
+        use agentgrid_skills::{DiscoveredSkill, Skill, SkillSource};
+        use std::collections::HashMap;
+        let mk = |name: &str, src: SkillSource, desc: &str| DiscoveredSkill {
+            skill: Skill {
+                name: name.into(),
+                description: desc.into(),
+                license: None,
+                compatibility: None,
+                allowed_tools: vec![],
+                metadata: HashMap::new(),
+                body: String::new(),
+            },
+            source: src,
+            path: std::path::PathBuf::from(format!("/x/{name}/SKILL.md")),
+        };
+        let discovered = vec![
+            mk("zebra", SkillSource::User, "last"),
+            mk("alpha", SkillSource::Project, "first multi\nline desc"),
+            mk("untrusted-one", SkillSource::Project, "x"),
+        ];
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(("alpha".to_string(), "project".to_string()));
+        trusted.insert(("zebra".to_string(), "user".to_string()));
+        let out = render_trusted_skills_block(&discovered, &trusted);
+        assert!(out.contains("Available agent skills (operator-trusted)"));
+        assert!(
+            out.contains("- alpha (project): first"),
+            "alpha trusted + rendered with first line of description"
+        );
+        assert!(out.contains("- zebra (user): last"));
+        assert!(
+            !out.contains("untrusted-one"),
+            "untrusted skill must be omitted (fail-closed)"
+        );
+        assert!(out.find("alpha").unwrap() < out.find("zebra").unwrap());
+        assert_eq!(
+            render_trusted_skills_block(&discovered, &std::collections::HashSet::new()),
+            ""
         );
     }
 

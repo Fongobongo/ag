@@ -41,6 +41,7 @@ rand = "0.8"
 agentgrid-common = { path = "crates/common" }
 agentgrid-adapters = { path = "crates/adapters" }
 agentgrid-acp = { path = "crates/acp" }
+agentgrid-skills = { path = "crates/skills" }
 
 # Stage 6.2: release profile tuned for small static binaries.
 [profile.release]
