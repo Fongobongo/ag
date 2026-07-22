@@ -5,7 +5,8 @@
 
 use agentgrid_common::{
     ApprovalView, CreateTaskRequest, CreateWorkflowRequest, CreateWorkflowRunRequest, LoginRequest,
-    LoginResponse, TaskEligibility, TaskStatus, TaskView, WorkflowStep, WorkflowTemplate,
+    LoginResponse, SkillTrustView, TaskEligibility, TaskStatus, TaskView, WorkflowStep,
+    WorkflowTemplate,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -50,6 +51,8 @@ enum AgCommand {
     Login(LoginArgs),
     /// Review and answer agent permission approvals (fail-closed by default).
     Approvals(ApprovalArgs),
+    /// Manage skill trust decisions (fail-closed: untrusted until trusted).
+    Skills(SkillsArgs),
     /// Start the control plane (standalone binary).
     Server(ServerStartArgs),
     /// Define and run Agentgrid workflows (DAGs of agent steps).
@@ -151,6 +154,35 @@ enum RepoAction {
 struct ApprovalArgs {
     #[command(subcommand)]
     action: ApprovalAction,
+}
+
+#[derive(Args)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    action: SkillsAction,
+}
+
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// List recorded skill trust decisions.
+    List {
+        /// Filter by skill source tier: project|user|managed.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Trust a skill (allow the agent to load/execute it).
+    Trust(SkillsNameArgs),
+    /// Untrust a skill (fail-closed: the agent must not use it).
+    Untrust(SkillsNameArgs),
+}
+
+#[derive(Args)]
+struct SkillsNameArgs {
+    /// Skill name (as discovered from SKILL.md frontmatter).
+    name: String,
+    /// Where the skill was found: project|user|managed (default project).
+    #[arg(long, default_value = "project")]
+    source: String,
 }
 
 #[derive(Subcommand)]
@@ -329,6 +361,7 @@ async fn main() -> Result<()> {
         AgCommand::Repo(a) => cmd_repo(&client, &base, a).await,
         AgCommand::Login(a) => cmd_login(&client, &base, a).await,
         AgCommand::Approvals(a) => cmd_approvals(&client, &base, a).await,
+        AgCommand::Skills(a) => cmd_skills(&client, &base, a).await,
         AgCommand::Server(a) => cmd_server_start(a),
         AgCommand::Workflow(a) => cmd_workflow(&client, &base, a, cli.json).await,
     }
@@ -852,6 +885,67 @@ async fn answer_approval(
         Ok(())
     } else {
         anyhow::bail!("approval {decision} failed ({})", resp.status())
+    }
+}
+
+/// Stage 9.2: skill trust management. A skill absent from the ledger is
+/// `untrusted` (fail-closed); trust/untrust records the operator decision.
+async fn cmd_skills(client: &reqwest::Client, base: &str, a: SkillsArgs) -> Result<()> {
+    match a.action {
+        SkillsAction::List { source } => {
+            let mut url = format!("{base}/v1/skills");
+            if let Some(s) = source {
+                url.push_str(&format!("?source={s}"));
+            }
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .context("skills list request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("skills list failed ({})", resp.status());
+            }
+            let rows: Vec<SkillTrustView> = resp.json().await.context("bad skills json")?;
+            if rows.is_empty() {
+                println!("no recorded skill trust decisions");
+            }
+            for s in &rows {
+                println!(
+                    "{:<24} {:<8} {:<8} {}",
+                    s.name,
+                    s.source,
+                    if s.trusted { "trusted" } else { "untrusted" },
+                    s.decided_by.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        SkillsAction::Trust(a) => set_skill_trust(client, base, &a.name, &a.source, "trust").await,
+        SkillsAction::Untrust(a) => {
+            set_skill_trust(client, base, &a.name, &a.source, "untrust").await
+        }
+    }
+}
+
+async fn set_skill_trust(
+    client: &reqwest::Client,
+    base: &str,
+    name: &str,
+    source: &str,
+    decision: &str,
+) -> Result<()> {
+    let resp = client
+        .post(format!(
+            "{base}/v1/skills/{name}/{decision}?source={source}"
+        ))
+        .send()
+        .await
+        .context("skill trust request failed")?;
+    if resp.status().is_success() {
+        println!("skill {name} ({source}) -> {decision}");
+        Ok(())
+    } else {
+        anyhow::bail!("skill {decision} failed ({})", resp.status())
     }
 }
 

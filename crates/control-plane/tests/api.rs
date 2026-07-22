@@ -8,9 +8,9 @@ use agentgrid_common::{
     CreateRepositoryRequest, CreateTaskRequest, CreateWorkflowRequest, CreateWorkflowRunRequest,
     EnrollRequest, EnrollResponse, EnrollTokenResponse, EventType, HeartbeatRequest, IncomingEvent,
     IngestEventsRequest, LoginResponse, NodeStatus, NodeView, PollRequest, PollResponse,
-    RepositoryView, TaskEligibility, TaskStatus, TaskView, UploadArtifactRequest, WorkflowRole,
-    WorkflowRun, WorkflowRunStatus, WorkflowRunWithSteps, WorkflowStep, WorkflowStepStatus,
-    WorkflowTemplate,
+    RepositoryView, SkillTrustView, TaskEligibility, TaskStatus, TaskView, UploadArtifactRequest,
+    WorkflowRole, WorkflowRun, WorkflowRunStatus, WorkflowRunWithSteps, WorkflowStep,
+    WorkflowStepStatus, WorkflowTemplate,
 };
 use agentgrid_control_plane::{build_router, AppState};
 use axum::body::{to_bytes, Body};
@@ -1623,6 +1623,14 @@ fn get_q(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn post_q(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn workflow_create_list_show_run_and_steps() {
     let state = AppState::open_temp().await.unwrap();
@@ -2396,4 +2404,90 @@ async fn node_protocol_mismatch_marks_degraded() {
         .find(|n| n.id == er.node_id)
         .expect("node present");
     assert_eq!(node.status, NodeStatus::Degraded);
+}
+
+#[tokio::test]
+async fn skill_trust_defaults_untrusted_then_round_trips() {
+    // Stage 9.2: an unrecorded skill is fail-closed untrusted; trusting it
+    // persists + is returned by GET and list; untrusting flips it back.
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state.clone());
+
+    // Unknown skill -> untrusted, no decided_by/at.
+    let got = app
+        .clone()
+        .oneshot(get_q("/v1/skills/ponytail?source=user"))
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let v: SkillTrustView =
+        serde_json::from_slice(&to_bytes(got.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(!v.trusted);
+    assert!(v.decided_by.is_none());
+
+    // Trust it.
+    let r = app
+        .clone()
+        .oneshot(post_q("/v1/skills/ponytail/trust?source=user"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: SkillTrustView = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/skills/ponytail?source=user"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(v.trusted);
+
+    // List reflects it.
+    let list: Vec<SkillTrustView> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/skills"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(list
+        .iter()
+        .any(|s| s.name == "ponytail" && s.source == "user" && s.trusted));
+
+    // Untrust flips back (decision still recorded, just trusted=false).
+    let r = app
+        .clone()
+        .oneshot(post_q("/v1/skills/ponytail/untrust?source=user"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: SkillTrustView = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/skills/ponytail?source=user"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!v.trusted);
+    assert!(
+        v.decided_by.is_some(),
+        "decision was recorded even when untrusted"
+    );
 }

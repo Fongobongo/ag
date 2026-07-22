@@ -64,6 +64,14 @@ export interface ApprovalView {
   decided_at?: string | null;
 }
 
+export interface SkillTrustView {
+  name: string;
+  source: string;
+  trusted: boolean;
+  decided_by?: string | null;
+  decided_at?: string | null;
+}
+
 export interface NodeEligibility {
   node_id: string;
   status: string;
@@ -220,6 +228,15 @@ export function listApprovals(status?: string) {
 
 export function answerApproval(id: string, decision: 'allow' | 'deny', reason?: string) {
   return req('POST', `/v1/approvals/${id}/${decision}`, reason ? { reason } : {});
+}
+
+export function listSkills(source?: string) {
+  return getJson<SkillTrustView[]>(source ? `/v1/skills?source=${encodeURIComponent(source)}` : '/v1/skills');
+}
+
+export function setSkillTrust(name: string, source: string, trusted: boolean) {
+  const dec = trusted ? 'trust' : 'untrust';
+  return req('POST', `/v1/skills/${encodeURIComponent(name)}/${dec}?source=${encodeURIComponent(source)}`);
 }
 
 export async function getArtifact(taskId: string, name: string): Promise<string | null> {

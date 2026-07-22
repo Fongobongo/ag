@@ -265,6 +265,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/policy/evaluate", post(evaluate_policy))
+        .route("/v1/skills", get(list_skills_trust_handler))
+        .route("/v1/skills/{name}", get(get_skill_trust_handler))
+        .route("/v1/skills/{name}/trust", post(trust_skill_handler))
+        .route("/v1/skills/{name}/untrust", post(untrust_skill_handler))
         .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/enrollment-token", post(create_enrollment_token))
@@ -615,6 +619,96 @@ async fn evaluate_policy(
         )
         .await;
     Json(verdict)
+}
+
+// ---- Skill trust (Stage 9.2) ----
+
+/// Query param for listing trust: `?source=project` filters by source tier.
+#[derive(serde::Deserialize)]
+struct SkillTrustQuery {
+    source: Option<String>,
+}
+
+async fn list_skills_trust_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SkillTrustQuery>,
+) -> Result<Json<Vec<agentgrid_common::SkillTrustView>>, StatusCode> {
+    let rows = state.store.list_skill_trust().await.map_err(|e| {
+        tracing::error!("list_skill_trust failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(match q.source {
+        Some(s) => rows.into_iter().filter(|r| r.source == s).collect(),
+        None => rows,
+    }))
+}
+
+async fn get_skill_trust_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SkillTrustQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<agentgrid_common::SkillTrustView>, StatusCode> {
+    let source = q.source.unwrap_or_else(|| "project".to_string());
+    state
+        .store
+        .get_skill_trust(&name, &source)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("get_skill_trust failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn trust_skill_handler(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthedUser>>,
+    Query(q): Query<SkillTrustQuery>,
+    Path(name): Path<String>,
+) -> StatusCode {
+    set_skill_trust(state, auth, &name, q.source.as_deref(), true).await
+}
+
+async fn untrust_skill_handler(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthedUser>>,
+    Query(q): Query<SkillTrustQuery>,
+    Path(name): Path<String>,
+) -> StatusCode {
+    set_skill_trust(state, auth, &name, q.source.as_deref(), false).await
+}
+
+async fn set_skill_trust(
+    state: Arc<AppState>,
+    auth: Option<Extension<AuthedUser>>,
+    name: &str,
+    source: Option<&str>,
+    trusted: bool,
+) -> StatusCode {
+    let actor = auth
+        .as_ref()
+        .map(|e| e.0.username.as_str())
+        .unwrap_or("system");
+    let source = source.unwrap_or("project");
+    if let Err(e) = state
+        .store
+        .set_skill_trust(name, source, trusted, actor)
+        .await
+    {
+        tracing::error!("set_skill_trust failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    let _ = state
+        .store
+        .audit(
+            actor,
+            None,
+            "skill.trust",
+            Some(&format!("{name}/{source}")),
+            Some(if trusted { "trusted" } else { "untrusted" }),
+        )
+        .await;
+    StatusCode::OK
 }
 
 #[derive(serde::Deserialize)]

@@ -66,11 +66,13 @@ pub enum EventType {
 }
 
 pub mod approval;
+pub mod skills_trust;
 mod state_machine;
 
 pub use approval::{
     next_approval, ApprovalEvent, ApprovalStatus, ApprovalView, InvalidApprovalTransition,
 };
+pub use skills_trust::SkillTrustView;
 pub use state_machine::{
     next_attempt_status, next_task_status, AttemptTransition, InvalidTransition, TaskTransition,
 };

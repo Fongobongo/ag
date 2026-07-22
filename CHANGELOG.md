@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (skills — trust ledger UI/CLI, Stage 9.2)
+
+- New control-plane skill-trust ledger (migration `0020_skill_trust`):
+  `GET /v1/skills[?source=]`, `GET /v1/skills/{name}?source=`, and
+  `POST /v1/skills/{name}/trust|untrust?source=`. Trust is keyed by
+  `(name, source)` where `source` is the skill discovery tier (`project|user|managed`).
+  A skill **absent from the ledger is `untrusted` (fail-closed)**: the agent may
+  not load or execute it until the operator explicitly trusts it. Every decision
+  is recorded in the audit log as `skill.trust`. `SkillTrustView` lives in
+  `agentgrid-common`.
+- CLI: `ag skills list [--source <tier>]`, `ag skills trust <name> [--source <tier>]`,
+  `ag skills untrust <name> [--source <tier>]`.
+- Web UI: new Skills view at `#/skills` (nav button next to Approvals) — a trust table
+  (✅/⛔) with a Trust/Untrust toggle per row (confirm prompt) and a 5s auto-poll.
+  Banner states the fail-closed default.
+- Covered by `skill_trust_defaults_untrusted_then_round_trips` (CP integration test).
+  Node-side skill discovery wiring (heartbeat report + enforcement on load) is a
+  follow-up — the ledger, endpoints, and operator surfaces are complete now.
+
 ### Added (node — command-policy integration into ACP permission flow, Stage 9.1)
 
 - The node daemon now short-circuits `session/request_permission` through the

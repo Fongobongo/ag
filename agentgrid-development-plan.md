@@ -288,6 +288,10 @@
   - [x] Web UI раздела Approvals (hash `#/approvals`): список (по умолчанию `pending`, filter=all — все), автополл 3 s, allow/deny через `window.prompt` с записью reason; reason/task дрожат в таблице. Covered `approval_flow_allow_deny_and_expiry` (CPHz тест проверят persists reason)
 - [x] Audit event на каждое policy decision и approval
 - [ ] Skill trust management UI/CLI
+  - [x] CP хранение trust-решений: миграция `0020_skill_trust`, `SkillTrustView` в common, методы store `set/get/list_skill_trust`. Эндпоинты `GET /v1/skills[?source=]`, `GET /v1/skills/{name}?source=`, `POST /v1/skills/{name}/trust|untrust?source=`. Каждое решение → audit `skill.trust`. Покрыто `skill_trust_defaults_untrusted_then_round_trips`.
+  - [x] CLI `ag skills list [--source]` / `trust <name> [--source]` / `untrust <name> [--source]`.
+  - [x] Web UI раздела Skills (`#/skills`): таблица доверия (✅/⛔), кнопка Trust/Untrust с confirm, автополл 5 s. Fail-closed плашка: ненайденный skill = untrusted.
+  - [ ] Wiring: node-сайд discovery (heartbeat report discovered skills + CP отвечает trust-verdict) + реальное enforcement (блок load/execute untrusted skill на ноде) — отдельный этап; пока trust-ledger и UI/CLI готовы, потребление на ноде ещё не подключено.
 - [x] Timeout неотвеченного approval → step `blocked`, не висящий run
 - [x] Tests: malicious `SKILL.md`, destructive command fixture → deny/ask; secrets не в approval payload
 

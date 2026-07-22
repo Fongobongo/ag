@@ -12,9 +12,9 @@ use agentgrid_common::{
     ApprovalStatus, ApprovalView, Assignment, AttemptStatus, AttemptTransition,
     CompleteAttemptRequest, CreateRepositoryRequest, CreateTaskRequest, EnrollRequest,
     EnrollResponse, EventType, HeartbeatRequest, IngestEventsRequest, NodeEligibility, NodeStatus,
-    NodeView, PollRequest, RepositoryView, TaskEligibility, TaskEvent, TaskStatus, TaskTransition,
-    TaskView, UploadArtifactRequest, WorkflowRole, WorkflowRun, WorkflowRunStatus, WorkflowStep,
-    WorkflowStepRun, WorkflowStepStatus, WorkflowTemplate,
+    NodeView, PollRequest, RepositoryView, SkillTrustView, TaskEligibility, TaskEvent, TaskStatus,
+    TaskTransition, TaskView, UploadArtifactRequest, WorkflowRole, WorkflowRun, WorkflowRunStatus,
+    WorkflowStep, WorkflowStepRun, WorkflowStepStatus, WorkflowTemplate,
 };
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
@@ -2012,6 +2012,82 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+// ---- Skill trust (Stage 9.2) ----
+
+impl Store {
+    /// Set trust state for `(name, source)`. Idempotent upsert; records the
+    /// operator that decided + when.
+    pub async fn set_skill_trust(
+        &self,
+        name: &str,
+        source: &str,
+        trusted: bool,
+        decided_by: &str,
+    ) -> Result<()> {
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO skills_trust (name, source, trusted, decided_by, decided_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (name, source) DO UPDATE SET \
+                 trusted = excluded.trusted, \
+                 decided_by = excluded.decided_by, \
+                 decided_at = excluded.decided_at",
+        )
+        .bind(name)
+        .bind(source)
+        .bind(if trusted { 1 } else { 0 })
+        .bind(decided_by)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read the recorded trust state for a single skill, or `untrusted` when
+    /// no decision exists yet.
+    pub async fn get_skill_trust(&self, name: &str, source: &str) -> Result<SkillTrustView> {
+        let row = sqlx::query(
+            "SELECT name, source, trusted, decided_by, decided_at FROM skills_trust \
+             WHERE name = ? AND source = ?",
+        )
+        .bind(name)
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .as_ref()
+            .map(skill_trust_from_row)
+            .unwrap_or_else(|| SkillTrustView {
+                name: name.to_string(),
+                source: source.to_string(),
+                trusted: false,
+                decided_by: None,
+                decided_at: None,
+            }))
+    }
+
+    /// All recorded trust decisions, newest decision first.
+    pub async fn list_skill_trust(&self) -> Result<Vec<SkillTrustView>> {
+        let rows = sqlx::query(
+            "SELECT name, source, trusted, decided_by, decided_at FROM skills_trust \
+             ORDER BY decided_at DESC, name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(skill_trust_from_row).collect())
+    }
+}
+
+fn skill_trust_from_row(r: &sqlx::sqlite::SqliteRow) -> SkillTrustView {
+    SkillTrustView {
+        name: r.try_get("name").unwrap_or_default(),
+        source: r.try_get("source").unwrap_or_default(),
+        trusted: r.try_get::<i64, _>("trusted").unwrap_or(0) != 0,
+        decided_by: r.try_get("decided_by").ok(),
+        decided_at: r.try_get("decided_at").ok(),
     }
 }
 

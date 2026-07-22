@@ -6,6 +6,7 @@ import Nodes from './components/Nodes';
 import NewTask from './components/NewTask';
 import TaskDetails from './components/TaskDetails';
 import Approvals from './components/Approvals';
+import Skills from './components/Skills';
 import { WorkflowsList, WorkflowDetails } from './components/Workflows';
 
 function parseHash(): { name: string; id?: string } {
@@ -13,6 +14,7 @@ function parseHash(): { name: string; id?: string } {
   const parts = h.split('/');
   if (parts[0] === 'nodes') return { name: 'nodes' };
   if (parts[0] === 'approvals') return { name: 'approvals' };
+  if (parts[0] === 'skills') return { name: 'skills' };
   if (parts[0] === 'new') return { name: 'new' };
   if (parts[0] === 'workflows') return { name: 'workflows' };
   if (parts[0] === 'workflow' && parts[1]) return { name: 'workflow', id: parts[1] };
@@ -61,6 +63,7 @@ export default function App() {
           <button className={cls('dashboard')} onClick={nav('#/')}>Dashboard</button>
           <button className={cls('nodes')} onClick={nav('#/nodes')}>Nodes</button>
           <button className={cls('approvals')} onClick={nav('#/approvals')}>Approvals</button>
+          <button className={cls('skills')} onClick={nav('#/skills')}>Skills</button>
           <button className={cls('workflows')} onClick={nav('#/workflows')}>Workflows</button>
           <button className={cls('new')} onClick={nav('#/new')}>New Task</button>
         </nav>
@@ -70,6 +73,7 @@ export default function App() {
         {route.name === 'dashboard' && <Dashboard onOpen={(id) => (window.location.hash = `#/task/${id}`)} />}
         {route.name === 'nodes' && <Nodes />}
         {route.name === 'approvals' && <Approvals />}
+        {route.name === 'skills' && <Skills />}
         {route.name === 'workflows' && <WorkflowsList onOpen={(id) => (window.location.hash = `#/workflow/${id}`)} />}
         {route.name === 'workflow' && route.id && <WorkflowDetails runId={route.id} />}
         {route.name === 'new' && (
