@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (common + control-plane — handoff packages reference commits, Stage 13)
+
+- Handoff messages now carry compact *references*, never full transcripts. New
+  `agentgrid_common::HandoffPackage { summary, commit_sha?, artifacts[] }`
+  + pure `build_handoff_payload(summary, commit_sha, artifacts) -> String`.
+- A step that succeeds emits an `output` message whose payload is a
+  `HandoffPackage` (summary + the winning attempt's commit SHA; `artifacts`
+  stays empty until a real artifact-store is wired).
+- `render_handoff_block` unpacks the package fields (`- summary`/`- commit`/
+  `- artifacts`) rather than dumping the raw JSON; `Note`/`Plan` kinds fall
+  back to raw text.
+- Tests: `handoff_payload_references_commit_and_artifacts_not_transcripts`,
+  `render_handoff_block_injects_typed_messages_and_passes_when_empty` (common).
+
 ### Added (common + control-plane — typed AgentMessage mailbox, Stage 13)
 
 - Orchestrator-mediated typed inter-step messages (no free-form P2P).

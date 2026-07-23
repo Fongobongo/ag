@@ -331,6 +331,36 @@ impl AgentMessageKind {
 
 /// Stage 13: parse `AgentMessageKind` from a snake_case stored tag.
 /// ponytail: only used by the store's read path.
+/// Stage 13: build the compact structured payload for an `output` handoff
+/// message. References commit_sha + summary, never a full transcript. Encoded
+/// as a single-line JSON string (`HandoffPackage`) so the mailbox stays
+/// compact and grep-able.
+/// ponytail: artifacts aren't stored yet (binary LargeObject API is deferred),
+/// `artifacts` stays an empty array until a real artifact-store is wired.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HandoffPackage {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+}
+
+/// Stage 13: serialize a `HandoffPackage` as the payload for an AgentMessage.
+/// Inverse: parse at the consumer (a typed renderer) — keeps transcripts out.
+pub fn build_handoff_payload(
+    summary: &str,
+    commit_sha: Option<&str>,
+    artifact_refs: &[String],
+) -> String {
+    let pkg = HandoffPackage {
+        summary: summary.to_string(),
+        commit_sha: commit_sha.map(|s| s.to_string()),
+        artifacts: artifact_refs.to_vec(),
+    };
+    serde_json::to_string(&pkg).unwrap_or_else(|_| "{}".into())
+}
+
 impl std::str::FromStr for AgentMessageKind {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -355,11 +385,27 @@ pub fn render_handoff_block(prompt: &str, messages: &[AgentMessage]) -> String {
     }
     let mut out = String::from("## Handoff from upstream steps\n");
     for m in messages {
+        // Prefer the compact `HandoffPackage` JSON payload (summary + commit
+        // reference + artifact refs); fall back to raw text for `plan`/`note`
+        // kinds that don't use the package shape.
+        let rendered = match serde_json::from_str::<HandoffPackage>(&m.payload) {
+            Ok(pkg) => {
+                let mut s = format!("- summary: {}\n", pkg.summary.trim());
+                if let Some(sha) = pkg.commit_sha.as_deref() {
+                    s.push_str(&format!("- commit: `{}`\n", sha));
+                }
+                if !pkg.artifacts.is_empty() {
+                    s.push_str(&format!("- artifacts: {}\n", pkg.artifacts.join(", ")));
+                }
+                s
+            }
+            Err(_) => format!("{}\n", m.payload.trim()),
+        };
         out.push_str(&format!(
-            "### `{}`: {}\n{}\n",
+            "### `{}`: {}\n{}",
             m.from_step_id,
             m.kind.as_str(),
-            m.payload.trim()
+            rendered
         ));
     }
     out.push('\n');
@@ -772,6 +818,34 @@ steps:
         assert!(out.contains("summary: designed approach"));
         assert!(out.contains("### `w1`: note"));
         assert!(out.ends_with("do work"), "original prompt kept at the tail");
+    }
+
+    #[test]
+    fn handoff_payload_references_commit_and_artifacts_not_transcripts() {
+        // A HandoffPackage payload is a compact structured reference (summary +
+        // commit_sha + artifact refs), never a transcript.
+        let p = build_handoff_payload(
+            "designed approach",
+            Some("deadbeef"),
+            &["art-1".to_string()],
+        );
+        let parsed: HandoffPackage = serde_json::from_str(&p).unwrap();
+        assert_eq!(parsed.summary, "designed approach");
+        assert_eq!(parsed.commit_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(parsed.artifacts, vec!["art-1"]);
+        assert!(!p.contains("transcript"));
+        // render_handoff_block unpacks the package fields, not the raw JSON.
+        let m = AgentMessage {
+            from_step_id: "arch".into(),
+            to_step_id: "*".into(),
+            kind: AgentMessageKind::Output,
+            payload: p,
+        };
+        let out = render_handoff_block("do work", &[m]);
+        assert!(out.contains("### `arch`: output"));
+        assert!(out.contains("- summary: designed approach"));
+        assert!(out.contains("- commit: `deadbeef`"));
+        assert!(out.contains("- artifacts: art-1"));
     }
 
     #[test]

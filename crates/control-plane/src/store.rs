@@ -2956,6 +2956,21 @@ impl Store {
             .filter(|s| !s.is_empty()))
     }
 
+    /// Stage 13: the commit SHA the winning attempt produced (a handoff
+    /// reference), if it ran in a git worktree. Compact info-only reference —
+    /// never carries a transcript (ADR: handoffs reference commits, not logs).
+    async fn attempt_commit_for_task(&self, task_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT commit_sha FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .and_then(|r| r.try_get::<Option<String>, _>("commit_sha").ok().flatten())
+            .filter(|s| !s.is_empty()))
+    }
+
     /// Stage 13: stamp a pending plan onto the run row (read on approval).
     async fn set_workflow_run_plan(&self, run_id: &str, plan: &str) -> Result<()> {
         sqlx::query("UPDATE workflow_runs SET plan = ? WHERE id = ?")
@@ -3232,17 +3247,30 @@ impl Store {
                                     // Stage 13 typed mailbox: emit a compact
                                     // `output` message broadcast to downstream
                                     // consuming steps (the orchestrator-mediated
-                                    // handoff, not free-form P2P).
+                                    // handoff, not free-form P2P). The payload
+                                    // is a `HandoffPackage` JSON (summary + the
+                                    // winning attempt's commit SHA), so a
+                                    // downstream step sees a *reference* to the
+                                    // upstream commit, never a transcript.
+                                    let commit_sha = self
+                                        .attempt_commit_for_task(&task_id)
+                                        .await
+                                        .unwrap_or(None);
+                                    let payload = agentgrid_common::build_handoff_payload(
+                                        &format!(
+                                            "step `{}` succeeded (task {task_id})",
+                                            step.step_id
+                                        ),
+                                        commit_sha.as_deref(),
+                                        &[],
+                                    );
                                     let _ = self
                                         .emit_workflow_message(
                                             run_id,
                                             &step.step_id,
                                             "*",
                                             agentgrid_common::AgentMessageKind::Output,
-                                            &format!(
-                                                "step `{}` succeeded; task {task_id}",
-                                                step.step_id
-                                            ),
+                                            &payload,
                                         )
                                         .await;
                                     // Stage 13 plan expansion: an
