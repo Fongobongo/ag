@@ -455,6 +455,22 @@ pub struct HeartbeatRequest {
     /// which adapters it can run, their versions, and whether each is ready.
     #[serde(default)]
     pub capabilities: Vec<AdapterCapability>,
+    /// Stage 9.2: skills the node discovered on disk this heartbeat. The
+    /// control plane upserts `(name, source)` rows into the trust ledger as
+    /// untrusted (operator never decided) without overwriting an existing
+    /// operator decision. Absent on legacy nodes (auto-discovery stays a
+    /// hint, never blocks a task).
+    #[serde(default)]
+    pub discovered_skills: Vec<HeartbeatSkill>,
+}
+
+/// A skill name + source ("project" | "user" | "managed") advertised in a
+/// heartbeat. Carries no path or body — the trust ledger only needs the
+/// identity, never the skill content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatSkill {
+    pub name: String,
+    pub source: String,
 }
 
 fn default_max_concurrency() -> u32 {
@@ -768,6 +784,7 @@ mod tests {
             active_attempts: 1,
             capabilities: vec![],
             protocol_version: None,
+            discovered_skills: vec![],
         };
         assert_eq!(round_trip(&hb), hb);
         let resp = EnrollResponse {

@@ -616,6 +616,7 @@ async fn revoked_node_gets_401() {
         active_attempts: 0,
         capabilities: vec![],
         protocol_version: None,
+        discovered_skills: vec![],
     };
     let resp = app
         .clone()
@@ -1414,6 +1415,7 @@ async fn node_offline_loses_attempt_then_retry_succeeds() {
         active_attempts: 1,
         capabilities: vec![],
         protocol_version: None,
+        discovered_skills: vec![],
     };
     let resp = app
         .clone()
@@ -3126,6 +3128,100 @@ async fn skill_trust_defaults_untrusted_then_round_trips() {
         v.decided_by.is_some(),
         "decision was recorded even when untrusted"
     );
+}
+
+#[tokio::test]
+async fn heartbeat_auto_fills_skill_trust_ledger() {
+    // Stage 9.2: a heartbeat that advertises discovered skills lands them in
+    // the trust ledger as untrusted (so the operator can review them); a
+    // later operator decision survives a subsequent discovery beat.
+    let state = AppState::open_temp().await.unwrap();
+    let app = build_router(state.clone());
+    let (_node_id, cred) = enroll(&app, "n-disc", vec!["mock".into()], vec!["*".into()]).await;
+
+    let hb = HeartbeatRequest {
+        status: Some(NodeStatus::Online),
+        name: "n-disc".into(),
+        adapters: vec!["mock".into()],
+        repositories: vec!["*".into()],
+        max_concurrency: 2,
+        agent_version: "t".into(),
+        load_avg: 0.0,
+        free_disk_mb: 1000,
+        active_attempts: 0,
+        capabilities: vec![],
+        protocol_version: None,
+        discovered_skills: vec![
+            agentgrid_common::HeartbeatSkill {
+                name: "git-helper".into(),
+                source: "user".into(),
+            },
+            agentgrid_common::HeartbeatSkill {
+                name: "ponytail".into(),
+                source: "user".into(),
+            },
+        ],
+    };
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            "/v1/node/heartbeat",
+            serde_json::to_string(&hb).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let list: Vec<SkillTrustView> = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/skills"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let gh = list
+        .iter()
+        .find(|s| s.name == "git-helper" && s.source == "user")
+        .expect("discovered skill landed in ledger");
+    assert!(!gh.trusted, "discovery defaults untrusted");
+
+    // Operator trusts it; a second discovery beat must not revert trust.
+    let _ = app
+        .clone()
+        .oneshot(post_q("/v1/skills/git-helper/trust?source=user"))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            "/v1/node/heartbeat",
+            serde_json::to_string(&hb).unwrap(),
+            &cred,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: SkillTrustView = serde_json::from_slice(
+        &to_bytes(
+            app.clone()
+                .oneshot(get_q("/v1/skills/git-helper?source=user"))
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(v.trusted, "operator decision survives re-discovery");
 }
 
 #[tokio::test]

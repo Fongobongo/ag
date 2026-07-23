@@ -1440,7 +1440,22 @@ async fn heartbeat(
         let _ = state.store.set_node_degraded(&auth.node_id).await;
     }
     match state.store.heartbeat(&auth.node_id, &req).await {
-        Ok(true) => StatusCode::OK,
+        Ok(true) => {
+            // Stage 9.2: auto-fill the trust ledger from heartbeat discovery.
+            // Upsert is idempotent and never overwrites an operator decision.
+            let discovered: Vec<(String, String)> = req
+                .discovered_skills
+                .iter()
+                .map(|s| (s.name.clone(), s.source.clone()))
+                .collect();
+            if !discovered.is_empty() {
+                if let Err(e) = state.store.upsert_discovered_skills(&discovered).await {
+                    // Discovery is best-effort; never fail the heartbeat on it.
+                    tracing::warn!("skill discovery upsert failed: {e}");
+                }
+            }
+            StatusCode::OK
+        }
         Ok(false) => StatusCode::NOT_FOUND,
         Err(e) => {
             tracing::error!("heartbeat failed: {e}");

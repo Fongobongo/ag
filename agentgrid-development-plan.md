@@ -295,7 +295,8 @@
   - [x] CLI `ag skills list [--source]` / `trust <name> [--source]` / `untrust <name> [--source]`.
   - [x] Web UI раздела Skills (`#/skills`): таблица доверия (✅/⛔), кнопка Trust/Untrust с confirm, автополл 5 s. Fail-closed плашка: ненайденный skill = untrusted.
   - [x] Wiring: node-сайд discovery — `compose_skills_block` в `drive_acp_session` перед `session_prompt`: discover навыков из worktree `.agents/skills` + `~/.agents/skills` (skills crate `standard_roots`/`discover`), fetch CP trust-ledger (`GET /v1/skills`), filter только trusted, append «Available agent skills» block в промпт. Fail-closed: untrusted/ошибка → блок пустой (skill не подсказан, задача не блокируется). Pure `render_trusted_skills_block` unit-проверен.
-  - [ ] Реальное enforcement на load/execute (блок входящего в агент untrusted skill, если агент сам читает `SKILL.md`) — не сейчас; только промпт-инъекция trusted catalog. Heartbeat-report discovered skills для автозаполнения таблицы — follow-up.
+  - [x] Heartbeat-report discovered skills для автозаполнения таблицы — `HeartbeatRequest.discovered_skills: Vec<HeartbeatSkill{name,source}>`; node discover'ит skills в project/user/managed roots каждый beat и репортит `(name, source)`. CP `upsert_discovered_skills` (`INSERT ... ON CONFLICT(name,source) DO NOTHING`)landит свежий skill как untrusted и **никогда** не перетирает operator decision. Покрыто `upsert_discovered_skills_defaults_untrusted_and_preserves_operator_decision` (store), `heartbeat_auto_fills_skill_trust_ledger` (api).
+  - [ ] Реальное enforcement на load/execute (блок входящего в агент untrusted skill, если агент сам читает `SKILL.md`) — не сейчас; только промпт-инъекция trusted catalog.
 - [x] Timeout неотвеченного approval → step `blocked`, не висящий run
 - [x] Tests: malicious `SKILL.md`, destructive command fixture → deny/ask; secrets не в approval payload
 

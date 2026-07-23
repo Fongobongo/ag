@@ -2205,6 +2205,30 @@ impl Store {
         Ok(rows.iter().map(skill_trust_from_row).collect())
     }
 
+    /// Stage 9.2: upsert skill rows a heartbeat discovered on disk. Insert
+    /// `INSERT ... ON CONFLICT DO NOTHING` so a freshly discovered skill lands
+    /// as untrusted, but an existing operator decision (trusted or untrusted)
+    /// is never overwritten — auto-discovery is a hint, never policy.
+    pub async fn upsert_discovered_skills(&self, skills: &[(String, String)]) -> Result<()> {
+        if skills.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (name, source) in skills {
+            sqlx::query(
+                "INSERT INTO skills_trust (name, source, trusted, decided_by, decided_at) \
+                 VALUES (?, ?, 0, 'discovery', NULL) \
+                 ON CONFLICT (name, source) DO NOTHING",
+            )
+            .bind(name)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Stage 13: MCP server registry. Insert or replace a trusted server.
     pub async fn upsert_mcp_server(&self, body: &McpServerCreate) -> Result<McpServer> {
         let now = now_iso();
@@ -4848,5 +4872,37 @@ mod workflow_tests {
             assert!(tasks.insert(t), "distinct task per parallel step");
         }
         assert_eq!(tasks.len(), 2, "two distinct task ids");
+    }
+
+    #[tokio::test]
+    async fn upsert_discovered_skills_defaults_untrusted_and_preserves_operator_decision() {
+        // Stage 9.2: a heartbeat that reports a new skill lands it as
+        // untrusted; a second heartbeat does not duplicate or flip trust; an
+        // operator decision (trusted) survives subsequent discovery.
+        let s = temp_store().await;
+        // Fresh skill -> untrusted discovery row.
+        s.upsert_discovered_skills(&[("git-helper".into(), "user".into())])
+            .await
+            .unwrap();
+        let v = s.get_skill_trust("git-helper", "user").await.unwrap();
+        assert!(!v.trusted, "freshly discovered defaults untrusted");
+        // Idempotent: a second heartbeat with the same discovery changes nothing.
+        s.upsert_discovered_skills(&[("git-helper".into(), "user".into())])
+            .await
+            .unwrap();
+        let v = s.get_skill_trust("git-helper", "user").await.unwrap();
+        assert!(!v.trusted);
+        // Operator trusts it; a later discovery must NOT revert trust.
+        s.set_skill_trust("git-helper", "user", true, "alice")
+            .await
+            .unwrap();
+        s.upsert_discovered_skills(&[("git-helper".into(), "user".into())])
+            .await
+            .unwrap();
+        let v = s.get_skill_trust("git-helper", "user").await.unwrap();
+        assert!(v.trusted, "operator decision preserved across discovery");
+        assert_eq!(v.decided_by.as_deref(), Some("alice"));
+        // Empty discovery is a cheap no-op (does not error).
+        s.upsert_discovered_skills(&[]).await.unwrap();
     }
 }

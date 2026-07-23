@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (common + control-plane + node-daemon — heartbeat skill auto-discovery, Stage 9.2)
+
+- The trust ledger now auto-fills from what nodes discover on disk, closing
+  the "heartbeat-report discovered skills для автозаполнения таблицы"
+  follow-up. `HeartbeatRequest` carries a new `discovered_skills:
+  Vec<HeartbeatSkill{ name, source }>` (default empty — backward compatible
+  with legacy nodes). Each heartbeat, the node runs the skills crate
+  `discover(standard_roots(...))` over the project/user/managed roots and
+  advertises the resolved `(name, source)` pairs.
+- Control plane: `Store::upsert_discovered_skills` does an idempotent
+  `INSERT ... ON CONFLICT(name, source) DO NOTHING` — a fresh skill lands as
+  untrusted (`trusted=0`, `decided_by='discovery'`) so it surfaces in the
+  Skills UI for review, but an existing operator decision (trusted or
+  untrusted) is never overwritten. Auto-discovery stays a hint: it never
+  blocks a task and a lookup error degrades to a no-op.
+- Tests: `upsert_discovered_skills_defaults_untrusted_and_preserves_operator_decision`
+  (store), `heartbeat_auto_fills_skill_trust_ledger` (api).
+
 ### Added (tests/e2e — variable CP-outage failure injection, Stage 2)
 
 - `tests/e2e/run-outbox.sh` Scenario D: a tunable (`AG_E2E_OUTAGE_SECS`,

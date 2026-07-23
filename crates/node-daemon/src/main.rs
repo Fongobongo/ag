@@ -2145,6 +2145,22 @@ async fn poll_loop(cfg: Config, cred: SavedCredential) -> Result<()> {
             };
             tokio::time::sleep(Duration::from_secs(hb_cfg.heartbeat_secs)).await;
             let active = hb_cfg.max_concurrency - hb_sem.available_permits() as u32;
+            // Stage 9.2: discover skills in the project/user/managed roots
+            // each beat and advertise their (name, source) so the control
+            // plane can auto-fill the trust ledger. Discovery is best-effort
+            // and never blocks the heartbeat on a parse/IO failure — the
+            // caller ignores diagnostics.
+            let hb_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let hb_roots =
+                agentgrid_skills::standard_roots(&hb_cfg.workspace_root, hb_home.as_deref());
+            let hb_discovered = agentgrid_skills::discover(&hb_roots).0;
+            let discovered_skills = hb_discovered
+                .iter()
+                .map(|d| agentgrid_common::HeartbeatSkill {
+                    name: d.skill.name.clone(),
+                    source: d.source.as_str().to_string(),
+                })
+                .collect::<Vec<_>>();
             let req = HeartbeatRequest {
                 status: Some(status),
                 name: hb_cfg.node_name.clone(),
@@ -2157,6 +2173,7 @@ async fn poll_loop(cfg: Config, cred: SavedCredential) -> Result<()> {
                 active_attempts: active,
                 capabilities,
                 protocol_version: Some(agentgrid_common::NODE_PROTOCOL_VERSION.into()),
+                discovered_skills,
             };
             if let Err(e) = hb_client
                 .post(format!("{}/v1/node/heartbeat", hb_cfg.server))
