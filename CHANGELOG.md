@@ -543,10 +543,42 @@ Key changes delivered in this push (see the detailed entries under `[Unreleased]
   `POST /v1/auth/logout`; CSRF mitigated via SameSite=Strict.
 
 Not yet closed (carried forward): binary-safe streaming artifact API +
-descriptor-relative (`openat`/`O_NOFOLLOW`) writes; SQLite outbox, outbox size
+"descriptor-relative (`openat`/`O_NOFOLLOW`) writes; SQLite outbox, outbox size
 limits / `output_truncated` backpressure, artifacts-in-spool; E2E `network
 disconnect` / `kill -9 daemon`; legacy-schema FK migration; bare-mirror shared
-clone / cross-process repo lock.
+clone / cross-process repo lock." — **binary-safe artifact API closed post-0.1.1** (see `[Unreleased]` / Stage 2.2 above).
+
+## [0.2.0] — tagged retrospectively (Stage 6 boundary)
+
+ACP interoperability (Stages 3–6), tracked post-hoc at the last Stage 6 commit.
+Subsequent workflow work shipped as 0.3.0; this tag freezes the 0.2 feature
+surface.
+
+- **Stage 3** — versioned `AgentEventEnvelope { version, kind, payload,
+  raw_ref }` over `TaskEvent`; extended kinds (`plan`, `tool_call`, `tool_result`,
+  `file_change`, `permission_request`, `usage`, `handoff`); `ExecutionBackend`
+  trait (native process + worktree first); `AgentSession` table + DTO;
+  cancellation normalized (`EventKind::Cancel` + node emits on cancel).
+- **Stage 4** — `SKILL.md` parser (YAML frontmatter), strict validation +
+  lenient diagnostics, discovery paths + scope precedence, progressive
+  disclosure, trust gate (project skills not active without explicit trust),
+  bundle manifest + hash verification + materialization, `RevisionStore`.
+- **Stage 5** — ACP southbound (`agentgrid-acp`): JSON-RPC 2.0 codec + stdio,
+  `initialize` / `session/new` / `session/prompt` / `session/cancel`,
+  `session/update` → `AgentEventEnvelope` mapping, durable approval flow
+  (state machine, `approvals` table, `/v1/approvals`, `ag approvals`,
+  auto-expiry, fail-closed), ACP adapter in registry.
+- **Stage 6** — ACP northbound gateway (`agentgrid acp-agent` over stdio);
+  ACP session ↔ Agentgrid task/workflow mapping, streaming events →
+  `session/update`, approval passthrough, `session/cancel`, `_agentgrid.dev`
+  extensions; honest `ask`/`worker` modes only (`architect`/`verifier`/
+  `orchestrator` advertised only after 0.3).
+
+Follow-up left open against the 0.2 plan: ProcessAdapter wrapper wrapping,
+  conformance suite fixtures, legacy-schema no-break migration audit, live
+  ACP-agent E2E, absolute-path / MCP stdio passthrough wiring, Skill E2E
+  round trips — see `agentgrid-development-plan.md` unchecked Stage 3–5 items.
+
 
 ## [0.3.0] — 2026-07-17
 
