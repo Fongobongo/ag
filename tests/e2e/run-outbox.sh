@@ -364,4 +364,37 @@ fi
 [ "$STATUS" = "succeeded" ] || { echo "  C FAILED: expected succeeded after retry, got $STATUS"; cat "$TMP/cp.log"; cat "$TMP/node.log"; exit 1; }
 echo "  C OK: lost attempt → retry → succeeded"
 
+echo ">> Scenario E: cancel mid-running → attempt cancelled (no leak)"
+
+# Earlier scenarios left a node running; restart it so the cancel test starts
+# from a clean beat (no stale attempts).
+[ -n "$NODE_PID" ] && { kill -9 "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null || true; }
+[ -n "$CP_PID" ] || { echo "  E FAILED: CP not running"; exit 1; }
+unset ENROLL_TOKEN
+start_node ""
+wait_node_online || exit 1
+
+echo "  submitting task sleep:30 (blocks one prompt turn)"
+TID=$(submit "sleep:30")
+echo "  task $TID; polling for running (timeout 15s)"
+reach=0
+for _ in $(seq 1 15); do
+  poll_status "$TID"
+  if [ "$STATUS" = "running" ]; then reach=1; break; fi
+  sleep 1
+done
+[ "$reach" = "1" ] || { echo "  E FAILED: never reached running before cancel, got $STATUS"; exit 1; }
+
+echo "  requesting cancellation via POST /v1/tasks/$TID/cancel"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/tasks/$TID/cancel" \
+  -H "authorization: Bearer $jwt")
+[ "$code" = "200" ] || { echo "  E FAILED: cancel returned $code"; exit 1; }
+
+echo "  polling task for terminal status (timeout 30s); expect cancelled"
+if wait_terminal "$TID" 30; then :; else
+  echo "  E FAILED: never reached terminal, got $STATUS"; cat "$TMP/node.log"; exit 1
+fi
+[ "$STATUS" = "cancelled" ] || { echo "  E FAILED: expected cancelled, got $STATUS"; cat "$TMP/node.log"; exit 1; }
+echo "  E OK: cancel aborted prompt turn, task cancelled"
+
 echo ">> E2E OK (all scenarios)"
