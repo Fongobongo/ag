@@ -27,7 +27,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 mod git;
@@ -959,36 +959,74 @@ async fn read_stream<R: AsyncRead + Unpin>(
     secrets: Vec<String>,
     raw: Option<Arc<Mutex<tokio::fs::File>>>,
 ) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let masked = mask_secrets(&line, &secrets);
-        if let Some(f) = &raw {
-            let mut g = f.lock().await;
-            let _ = g.write_all(masked.as_bytes()).await;
-            let _ = g.write_all(b"\n").await;
+    // Stage 519: read manually so a process killed mid-line (no trailing
+    // newline) does not silently drop its final partial output. `BufReader::
+    // lines()` swallows a partial tail on EOF; here we flush any remainder as a
+    // final raw/stderr line so a crashed adapter's last half-event is preserved
+    // (best-effort) rather than lost.
+    let mut buf = tokio::io::BufReader::new(reader);
+    let mut acc = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        byte[0] = 0;
+        match buf.read(&mut byte).await {
+            Ok(0) => break,
+            Ok(_) => {
+                acc.push(byte[0]);
+                if byte[0] == b'\n' {
+                    emit_line(&acc, &sink, stream, &secrets, &raw).await;
+                    acc.clear();
+                }
+            }
+            Err(_) => break,
         }
-        // Stage 3.1: accept the versioned envelope first; fall back to the
-        // legacy `{type, payload}` adapter event; anything else is a raw log.
-        // Unknown kinds are preserved (never fatal).
-        if let Ok(env) = serde_json::from_str::<AgentEventEnvelope>(&masked) {
-            sink.push(env.kind.to_event_type(), env.payload).await;
+    }
+    if !acc.is_empty() {
+        emit_line(&acc, &sink, stream, &secrets, &raw).await;
+    }
+}
+
+async fn emit_line(
+    line: &[u8],
+    sink: &Arc<EventSink>,
+    stream: &str,
+    secrets: &[String],
+    raw: &Option<Arc<Mutex<tokio::fs::File>>>,
+) {
+    // strip the trailing newline if present (single line only here)
+    let trimmed: &[u8] = if line.last() == Some(&b'\n') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    let s = String::from_utf8_lossy(trimmed).to_string();
+    let masked = mask_secrets(&s, secrets);
+    if let Some(f) = raw {
+        let mut g = f.lock().await;
+        let _ = g.write_all(masked.as_bytes()).await;
+        let _ = g.write_all(b"\n").await;
+    }
+    // Stage 3.1: accept the versioned envelope first; fall back to the
+    // legacy `{type, payload}` adapter event; anything else is a raw log.
+    // Unknown kinds are preserved (never fatal).
+    if let Ok(env) = serde_json::from_str::<AgentEventEnvelope>(&masked) {
+        sink.push(env.kind.to_event_type(), env.payload).await;
+        sink.note_adapter_event();
+        return;
+    }
+    match serde_json::from_str::<AdapterEvent>(&masked) {
+        Ok(ae) => {
+            sink.push(to_event_type(&ae.r#type), ae.payload).await;
             sink.note_adapter_event();
-            continue;
         }
-        match serde_json::from_str::<AdapterEvent>(&masked) {
-            Ok(ae) => {
-                sink.push(to_event_type(&ae.r#type), ae.payload).await;
-                sink.note_adapter_event();
-            }
-            Err(_) => {
-                let ty = if stream == "stderr" {
-                    EventType::Stderr
-                } else {
-                    EventType::Stdout
-                };
-                sink.push(ty, json!({ "text": masked })).await;
-                sink.note_adapter_event();
-            }
+        Err(_) => {
+            let ty = if stream == "stderr" {
+                EventType::Stderr
+            } else {
+                EventType::Stdout
+            };
+            sink.push(ty, json!({ "text": masked })).await;
+            sink.note_adapter_event();
         }
     }
 }
@@ -2619,6 +2657,43 @@ mod tests {
         let got = tokio::fs::read_to_string(&raw_path).await.unwrap();
         assert!(got.contains("hello"), "structured line mirrored: {got}");
         assert!(got.contains("not json"), "unparsed line mirrored: {got}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_stream_preserves_trailing_partial_line_on_eof() {
+        // Stage 519: an adapter process killed mid-line (no trailing newline)
+        // must not silently drop its final partial output. The partial tail is
+        // flushed as a final raw line so the crashed adapter's last half-event
+        // is preserved (best-effort) instead of lost.
+        let dir = std::env::temp_dir().join(format!("ag-part-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let raw_path = std::path::Path::new(&dir).join("raw.log");
+        let f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&raw_path)
+            .await
+            .unwrap();
+        let raw = Arc::new(Mutex::new(f));
+        // Complete line + a partial line with NO trailing newline.
+        let input =
+            b"{\"type\":\"log\",\"payload\":{\"text\":\"line1\"}}\ncrashed mid-bytes".to_vec();
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let sink = EventSink::new(
+            "a1".into(),
+            reqwest::Client::new(),
+            "http://x".into(),
+            test_outbox("a1"),
+        );
+        read_stream(reader, sink, "stdout", vec![], Some(raw.clone())).await;
+        let got = tokio::fs::read_to_string(&raw_path).await.unwrap();
+        assert!(got.contains("line1"), "complete line mirrored: {got}");
+        assert!(
+            got.contains("crashed mid-bytes"),
+            "partial tail (no trailing newline) must be preserved, got: {got}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

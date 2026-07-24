@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (node-daemon — adapter crash mid-line, Stage 519)
+
+- `read_stream` no longer silently drops an adapter's final partial output when
+  the process is killed mid-line (no trailing newline on EOF). It previously
+  used `BufReader::lines()`, which swallows a partial tail; now it reads byte by
+  byte and flushes the remainder as a final raw `stdout`/`stderr` line, so a
+  crashed adapter's last half-event is preserved (best-effort) instead of lost.
+- Test: `read_stream_preserves_trailing_partial_line_on_eof`.
+- Note: NDJSON-frame parsing on the ACP `session/update` path lives in the
+  `agentgrid_acp` crate (Content-Length framed); a mid-JSON-RPC-frame crash
+  regression test there is a follow-up (needs a mock ACP peer).
+
 ### Added (node-daemon — cluster executor capability probe, Stage 10 / line 333)
 
 - The node now actually probes the `zeroshot` cluster-executor adapter's
