@@ -355,12 +355,12 @@
 
 - [x] `SandboxKind` (None|Docker) из `AGENTGRID_SANDBOX`. `sandbox_command` обёртывает `(program,args)`: NoSandbox passthrough, Docker = `docker run --rm -i -v <wd>:/ag -w /ag <image> --`. Default off.
 - [x] ACP path (native launcher + wrapper binary) роутится через `sandbox_command`.
-- [ ] Legacy `ExecutionBackend` wrapper path не sandboxed (TODO; ACP = forward path).
+- [x] Legacy `ExecutionBackend` wrapper path не sandboxed (TODO; ACP = forward path) — закрыто: `SpawnRequest::sandbox_prefix_args` + `sandbox_prefix(kind, workdir, program)` в `sandbox.rs`; legacy атеtsadem `run_attempt` spawn сейчас роутит через sandbox (Docker image), как и ACP path. Default `AGENTGRID_SANDBOX=none` — passthrough. Тесты: `none_prefix_passthrough`, `docker_prefix_wraps_program`; `ProcessBackend.spawn` использовывает `args` prefix. Конформанс и базовые backends исправлены в соответствии с новой формой.
 
 ### 11.3 `agent-profile` SSOT (из oh-my-agent) — done (minimal)
 
 - [x] `AGENTGRID_AGENT_PROFILE_<ID>` (путь к .md или inline) → node пишет `AGENTS.md` в worktree + env `AGENTGRID_SYSTEM_PROMPT`. Кросс-агентная конвенция.
-- [ ] Per-agent native projection (`CLAUDE.md`, `.kiro/`) — follow-up mapping table.
+- [x] Per-agent native projection (`CLAUDE.md`, `.kiro/`) — mapping table `native_projection_files(adapter_id)`: `claude → CLAUDE.md` (verbatim copyAGENTS.md text в каждый нативный convention file); расширен по наблюдаемым adapterам (mock/opencode/unknown — emptyysterious AGENTS.md достаточно). Тест: `native_projection_files_table`.
 
 ### 11.4 Feedback-loop CI→agent (из AgentWrapper) — done
 

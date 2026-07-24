@@ -14,6 +14,11 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 /// Inputs needed to spawn one attempt's agent process.
 pub struct SpawnRequest {
     pub bin: String,
+    /// Optional args to insert before the adapter's `--prompt <prompt>` args.
+    /// Stage 11.2 / line 358: used to route the legacy wrapper-binary path
+    /// through `sandbox_command` (e.g. Docker: `docker run --rm -i -v …`).
+    /// Empty → no sandbox passthrough, matching prior behaviour.
+    pub sandbox_prefix_args: Vec<String>,
     pub prompt: String,
     pub workdir: PathBuf,
     pub attempt_id: String,
@@ -116,6 +121,10 @@ pub struct ProcessBackend;
 impl ExecutionBackend for ProcessBackend {
     fn spawn(&self, req: SpawnRequest) -> std::io::Result<BackendProcess> {
         let mut cmd = Command::new(&req.bin);
+        // Stage 11.2 / line 358: route the legacy wrapper-binary path through
+        // the sandbox (e.g. Docker) when the node supplied prefix args; empty
+        // → passthrough as before.
+        cmd.args(&req.sandbox_prefix_args);
         cmd.arg("--prompt").arg(&req.prompt);
         cmd.current_dir(&req.workdir);
         cmd.env("AGENTGRID_ATTEMPT_ID", &req.attempt_id);
@@ -149,6 +158,7 @@ mod tests {
     fn req(bin: &str) -> SpawnRequest {
         SpawnRequest {
             bin: bin.into(),
+            sandbox_prefix_args: vec![],
             prompt: "ignored".into(),
             workdir: std::env::temp_dir(),
             attempt_id: "t".into(),

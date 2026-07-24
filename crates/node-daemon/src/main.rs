@@ -283,10 +283,34 @@ fn resolve_acp_launch(adapter_id: &str) -> Option<(String, Vec<String>)> {
 /// Agent profile (idea: oh-my-agent SSOT): an optional system prompt for this
 /// adapter. `AGENTGRID_AGENT_PROFILE_<ID>` is either a path to a `.md` file
 /// (read) or inline text. Returns None when unset. Projected into the worktree
-/// as `AGENTS.md` (cross-agent convention); per-agent native projection
-/// (`CLAUDE.md`, `.kiro/`) is a follow-up mapping table.
-// ponytail: single AGENTS.md projection; native per-agent files if an agent
-// ignores AGENTS.md.
+/// as `AGENTS.md` (cross-agent convention) base; the per-agent native
+/// projection files returned by [`native_projection_files`] are written from
+/// the same profile text so agents that only read their own convention file
+/// (`CLAUDE.md`, `.kiro/...`) still pick it up.
+// ponytail: single AGENTS.md projection; native per-agent files
+// only for adapters known to ignore AGENTS.md — extend the table as agents
+// are observed to need it.
+/// Stage 11.3 / line 363: per-agent native projection files that an adapter
+/// reads in preference to the cross-agent `AGENTS.md`. Empty for adapters
+/// known to honor `AGENTS.md` (mock, opencode, generic wrappers); added per
+/// observed agent convention. Each file mirrors the same profile text, so an
+/// agent that reads only its own convention file still sees the projected
+/// system prompt.
+///
+/// Mapping table (expand as new adapters are observed to ignore `AGENTS.md`):
+/// - `claude` — `CLAUDE.md`
+/// - others return empty (the cross-agent `AGENTS.md` is enough).
+//
+// ponytail: verbatim copies grow with each adapter's convention; if file
+// formats diverge (e.g. a steering YAML) swap to per-adapter formatters
+// when an agent no longer accepts the shared text verbatim.
+fn native_projection_files(adapter_id: &str) -> Vec<&'static str> {
+    match adapter_id {
+        "claude" => vec!["CLAUDE.md"],
+        _ => vec![],
+    }
+}
+
 fn agent_profile(adapter_id: &str) -> Option<String> {
     let key = format!(
         "AGENTGRID_AGENT_PROFILE_{}",
@@ -1429,6 +1453,17 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     if let Some(text) = &prompt_text {
         let p = ws.path.join("AGENTS.md");
         let _ = tokio::fs::write(&p, text).await;
+        // Stage 11.3 / line 363: also write the per-agent native convention
+        // file(s) that an adapter observes in preference to `AGENTS.md`.
+        // Each is a verbatim copy of the same profile text; agents reading
+        // either see the same guidance.
+        for rel in native_projection_files(&assignment.adapter) {
+            let f = ws.path.join(rel);
+            if let Some(parent) = f.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&f, text).await;
+        }
     }
 
     // Stage 5: ACP adapters are driven over JSON-RPC 2.0 (stdio), not stdout
@@ -1551,9 +1586,10 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
         }
     };
     // Stage 3.2: spawn through the ExecutionBackend contract (native process).
-    // ponytail: sandbox not applied here (legacy wrapper path); the ACP path
-    // is sandboxed. Wire Sandbox into ExecutionBackend if legacy isolation is
-    // needed.
+    // Stage 11.2 / line 358: the legacy wrapper path is now sandboxed too via
+    // `sandbox_prefix` -> `SpawnRequest::sandbox_prefix_args` (matches the ACP
+    // path's `sandbox_command`); `AGENTGRID_SANDBOX=docker` pulls the adapter
+    // runs inside the configured image. Default `none` is passthrough.
     //
     // Feedback loop (Stage 11.4): when a validation_command is configured and
     // the agent exits 0 but validation fails, re-spawn the agent with the
@@ -1612,9 +1648,15 @@ async fn run_attempt(cfg: Config, client: reqwest::Client, assignment: Assignmen
     }
 
     let mut round = 0usize;
+    // Stage 11.2 / line 358: route the legacy wrapper-binary spawn through
+    // the configured sandbox (matches the ACP path). `sandbox_prefix` splits
+    // the program from the prefix args because ProcessBackend appends its own
+    // `--prompt <prompt>` after the prefix.
+    let (sb_program, sb_prefix) = sandbox::sandbox_prefix(cfg.sandbox, &ws.path, &bin);
     let validation_passed = loop {
         let req = agentgrid_adapters::SpawnRequest {
-            bin: bin.clone(),
+            bin: sb_program.clone(),
+            sandbox_prefix_args: sb_prefix.clone(),
             prompt: prompt.clone(),
             workdir: ws.path.clone(),
             attempt_id: assignment.attempt_id.clone(),
@@ -3381,5 +3423,14 @@ mod tests {
         std::env::set_var("AGENTGRID_AGENT_PROFILE_TESTAG", "");
         assert_eq!(agent_profile("testag"), None);
         std::env::remove_var("AGENTGRID_AGENT_PROFILE_TESTAG");
+    }
+
+    #[test]
+    fn native_projection_files_table() {
+        // Stage 11.3 / line 363: claude -> CLAUDE.md; adapters that honor
+        // AGENTS.md (mock, opencode, unknown) -> empty.
+        assert_eq!(native_projection_files("claude"), vec!["CLAUDE.md"]);
+        assert!(native_projection_files("mock").is_empty());
+        assert!(native_projection_files("unknown-adapter").is_empty());
     }
 }

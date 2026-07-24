@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added (node-daemon — per-agent native projection, Stage 11.3 / line 363)
+
+- The agent profile is now also projected into each adapter's native convention
+  file, not just `AGENTS.md`. `native_projection_files(adapter_id)` maps
+  `claude → CLAUDE.md` (verbatim copy of the profile text); other adapters
+  honor `AGENTS.md` and return empty. Table is meant to grow as adapters are
+  observed to ignore `AGENTS.md`.
+- Test: `native_projection_files_table`.
+
+### Fixed (node-daemon — sandbox the legacy wrapper-binary spawn, Stage 11.2 / line 358)
+
+- The legacy `ExecutionBackend` wrapper-binary spawn path (raw adapter subprocess)
+  bypassed the sandbox that the ACP path applies via `sandbox_command`. New
+  `SpawnRequest::sandbox_prefix_args` + `sandbox::sandbox_prefix(kind, workdir,
+  program)` route the legacy spawn through the configured sandbox too.
+  `AGENTGRID_SANDBOX=docker` now wraps the `adapter-<id>` binary in `docker run
+  --rm -i -v <wd>:/ag -w /ag <image> --` for legacy attempts; default `none` is
+  passthrough as before.
+- Tests: `none_prefix_passthrough`, `docker_prefix_wraps_program`.
+
 ### Fixed (node-daemon — bounded ACP session_cancel on interrupt, Stage 5 / line 192)
 
 - `drive_acp_session`'с `session_cancel` RPC on the cancel branch was unbounded: an

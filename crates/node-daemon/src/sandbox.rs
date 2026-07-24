@@ -30,6 +30,44 @@ impl SandboxKind {
     }
 }
 
+/// Prefix args + program to run `program ...` inside the configured sandbox,
+/// rooted at `workdir`. Used by the legacy wrapper-binary spawn path (Stage
+/// 11.2 / line 358): `SpawnRequest { bin: program,
+/// sandbox_prefix_args }` then appends `--prompt <prompt>`. `None` → no
+/// prefix (passthrough as before); `Docker` → `docker run --rm -i -v … -- <image>`
+/// with `program` placed inside the container after `--`.
+///
+/// `sandbox_command` (for the ACP path) keeps returning the fullwrapped
+/// `(program, args)` already including `program`; this variant splits them
+/// because the legacy ExecutionBackend appends its own `--prompt` after the
+/// prefix.
+pub fn sandbox_prefix(
+    kind: SandboxKind,
+    workdir: &std::path::Path,
+    program: &str,
+) -> (String, Vec<String>) {
+    match kind {
+        SandboxKind::None => (program.to_string(), vec![]),
+        SandboxKind::Docker => {
+            let image =
+                std::env::var("AGENTGRID_SANDBOX_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".into());
+            let prefix = vec![
+                "run".into(),
+                "--rm".into(),
+                "-i".into(),
+                "-v".into(),
+                format!("{}:/ag", workdir.display()),
+                "-w".into(),
+                "/ag".into(),
+                "--".into(),
+                image,
+                program.into(),
+            ];
+            ("docker".into(), prefix)
+        }
+    }
+}
+
 /// Wrap `(program, args)` for the configured sandbox, rooted at `workdir`.
 /// `None` returns the command unchanged. `Docker` prefixes with
 /// `docker run --rm -i -v <workdir>:/ag -w /ag <image> --`.
@@ -97,5 +135,31 @@ mod tests {
         assert_eq!(a[a.len() - 2], "claude");
         assert_eq!(a[a.len() - 1], "--acp");
         std::env::remove_var("AGENTGRID_SANDBOX_IMAGE");
+    }
+
+    #[test]
+    fn none_prefix_passthrough() {
+        // Stage 11.2 / line 358: no sandbox → identity bin, empty prefix.
+        let (p, a) = sandbox_prefix(SandboxKind::None, std::path::Path::new("/w"), "adapter-x");
+        assert_eq!(p, "adapter-x");
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn docker_prefix_wraps_program() {
+        // Legacy wrapper path: program runs inside the image after `--`, with
+        // an empty `args` slot (ProcessBackend appends `--prompt` itself).
+        std::env::set_var("AGENTGRID_SANDBOX_IMAGE", "img:1");
+        let (p, a) = sandbox_prefix(
+            SandboxKind::Docker,
+            std::path::Path::new("/w"),
+            "adapter-claude",
+        );
+        std::env::remove_var("AGENTGRID_SANDBOX_IMAGE");
+        assert_eq!(p, "docker");
+        assert_eq!(a[0], "run");
+        assert!(a.contains(&"-v".to_string()));
+        assert_eq!(a[a.len() - 2], "img:1");
+        assert_eq!(a[a.len() - 1], "adapter-claude");
     }
 }

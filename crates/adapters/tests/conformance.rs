@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 async fn mock_adapter_start_stream_collect() {
     let req = SpawnRequest {
         bin: env!("CARGO_BIN_EXE_adapter-mock").to_string(),
+        sandbox_prefix_args: vec![],
         prompt: "write:hello.txt:hi".into(),
         workdir: std::env::temp_dir(),
         attempt_id: "attempt-conform".into(),
