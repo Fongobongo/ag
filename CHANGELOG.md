@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed (node-daemon — bounded ACP session_cancel on interrupt, Stage 5 / line 192)
+
+- `drive_acp_session`'с `session_cancel` RPC on the cancel branch was unbounded: an
+  ACP subprocess already tearing down (or ignoring `session/cancel`) could park
+  `drive_acp_session` forever past the cancel, blocking the attempt from
+  reaching its terminal `cancelled` state. Now wrapped in a 2s timeout, after
+  which `terminate_group` + bounded reap still force-terminates the subprocess.
+- New test: `drive_acp_session_cancel_mid_prompt_turn` (dummy cancel-ready CP,
+  fake-acp hang mode made interruptible via a stdin-reader thread).
+
 ### Fixed (node-daemon — adapter crash mid-line, Stage 519)
 
 - `read_stream` no longer silently drops an adapter's final partial output when

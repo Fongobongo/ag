@@ -1235,7 +1235,15 @@ async fn drive_acp_session(
             Err(e) => AcpResult { success: false, error_code: Some(format!("agent_error: {e}")), session_id: Some(session_id.clone()) },
         },
         _ = wait_for_cancel(cancel_client, cancel_url) => {
-            acp.session_cancel(SessionCancelParams { session_id: session_id.clone() }).await.ok();
+            // Ponytail: bound the session_cancel RPC so a process already
+            // tearing down (or one that ignores session/cancel) can't park
+            // drive_acp_session forever. The reap below still enforces
+            // termination via signals.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                acp.session_cancel(SessionCancelParams { session_id: session_id.clone() }),
+            )
+            .await;
             // Bound the reap for the same reason as the timeout branch.
             terminate_group(pid);
             let _ = tokio::time::timeout(
@@ -2753,6 +2761,41 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// A dummy CP that routes `/cancel` requests to a fixed `CancelState`
+    /// (always cancel-requested) and everything else to empty 200 OK. Used to
+    /// exercise `drive_acp_session`'s cancel race without a real control plane.
+    async fn dummy_cancel_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = s.read(&mut buf).await;
+                    let req = String::from_utf8_lossy(&buf);
+                    if req.contains("/cancel") {
+                        let body = r#"{"cancel_requested":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}",
+                            len = body.len(),
+                            body = body
+                        );
+                        let _ = s.write_all(resp.as_bytes()).await;
+                    } else {
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// A dummy CP that always answers a fixed JSON profile list (Stage 13 fetch).
     async fn dummy_profile_server(body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3220,6 +3263,113 @@ mod tests {
             Some("timeout"),
             "expected timeout error_code, got {:?}",
             res.error_code
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Stage 5 / line 192: a cancel requested mid prompt turn must interrupt
+    /// the ACP `session/prompt`, send `session/cancel`, reap the subprocess,
+    /// and resolve the attempt as `cancelled` (not timeout, not success).
+    #[tokio::test]
+    async fn drive_acp_session_cancel_mid_prompt_turn() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let fake = [
+            "../../target/debug/adapter-fake-acp",
+            "../../target/release/adapter-fake-acp",
+        ]
+        .iter()
+        .map(|p| std::path::Path::new(manifest).join(p))
+        .find(|p| p.is_file())
+        .expect("fake ACP agent built");
+        let bin_dir = fake.parent().unwrap();
+        let orig = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{orig}", bin_dir.display()));
+        // Dummy CP that reports `cancel_requested=true` on the cancel GET,
+        // so `wait_for_cancel` (polls every 1s) races against the hung prompt.
+        let server = dummy_cancel_server().await;
+        let cfg = Config {
+            server: server.clone(),
+            node_name: "test".into(),
+            workspace_root: std::env::temp_dir().join("ag-acp-ws-cancel"),
+            max_concurrency: 2,
+            agent_version: "0.1.0".into(),
+            adapters: vec![AdapterSpec {
+                id: "fake-acp".into(),
+                protocol: AdapterProtocol::Acp,
+            }],
+            repositories: vec!["*".into()],
+            heartbeat_secs: 10,
+            enroll_token: None,
+            credential_path: std::env::temp_dir().join("ag-acp-cred-cancel.json"),
+            repository_root: std::env::temp_dir().join("ag-acp-repos-cancel"),
+            secrets: vec![],
+            sandbox: sandbox::SandboxKind::None,
+            adapter_env: vec![("AG_FAKE_HANG".into(), "1".into())],
+            outbox_root: std::env::temp_dir()
+                .join(format!("ag-acp-outbox-cancel-{}", uuid::Uuid::new_v4())),
+            completion_outbox: Arc::new(
+                outbox::CompletionOutbox::open(
+                    &std::env::temp_dir()
+                        .join(format!("ag-acp-comp-cancel-{}", uuid::Uuid::new_v4())),
+                )
+                .unwrap(),
+            ),
+            autonomy: AutonomyLevel::default(),
+            adapter_versions: Default::default(),
+        };
+        let ws = std::env::temp_dir().join(format!(
+            "ag-acp-cancel-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let assignment = Assignment {
+            attempt_id: format!("att-cancel-{}", uuid::Uuid::new_v4()),
+            task_id: "t1".into(),
+            repository: "*".into(),
+            prompt: "do the thing".into(),
+            adapter: "fake-acp".into(),
+            number: 1,
+            // Long timeout so the cancel race wins, not the timeout.
+            timeout_secs: 30,
+            git_url: String::new(),
+            default_branch: String::new(),
+            validation_command: None,
+            base_commit: None,
+            parent_acp_session_id: None,
+            provenance: None,
+            upstream_commits: vec![],
+        };
+        let sink = EventSink::new(
+            assignment.attempt_id.clone(),
+            reqwest::Client::new(),
+            cfg.server.clone(),
+            Arc::new(outbox::EventOutbox::open(&cfg.outbox_root, &assignment.attempt_id).unwrap()),
+        );
+        let res = tokio::time::timeout(
+            Duration::from_secs(20),
+            drive_acp_session(
+                &cfg,
+                &reqwest::Client::new(),
+                &assignment,
+                &ws,
+                sink.clone(),
+            ),
+        )
+        .await
+        .expect("drive_acp_session must not hang on cancel")
+        .unwrap();
+        assert!(!res.success, "cancelled ACP session should not succeed");
+        assert_eq!(
+            res.error_code.as_deref(),
+            Some("cancelled"),
+            "expected cancelled error_code, got {:?}",
+            res.error_code
+        );
+        assert_eq!(
+            res.session_id.as_deref(),
+            Some("sess-fake-1"),
+            "session_id still reported on cancel"
         );
         std::fs::remove_dir_all(&ws).ok();
     }

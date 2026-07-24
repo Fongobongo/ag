@@ -189,7 +189,7 @@
 - [x] Node-daemon spawn через `AcpClient`: `initialize`→`session/new`→`session/prompt`, стрим `session/update`→event sink, `request_permission`→durable approval poll; cancel/timeout внутри `drive_acp_session`
 - [x] Conformance fixtures: initialize/session-new/plan-update/tool-call/diff/permission/cancel (acp crate tests: lifecycle + full `session/update` vocabulary mapping + `session/cancel` acknowledged)
 - [ ] Запустить минимум один реальный ACP-compatible agent E2E (локально и на удалённой node)
-- [ ] Test: cancellation обрывает prompt turn и завершает attempt `cancelled`
+- [x] Test: cancellation обрывает prompt turn и завершает attempt `cancelled` — `drive_acp_session_cancel_mid_prompt_turn`: dummy CP, отвечающий `cancel_requested=true` на cancel GET, § race против prompŧ fake-acp hang; үrine: `session_cancel` RPC bounded (`tokio::time::timeout(2s)`, чтобы hung peer не пар negativity reset), затем terminate_group + bounded reap, `error_code = cancelled`, `session_id` сохранен. Фیکс: bounded `session_cancel` (процесс, уже tearing down, не парил drive_acp_session). fake-acp hang mode теперь прерывистой (thread читает stdin, флаг cancel).
 - [x] Test: kill ACP subprocess посреди JSON frame → attempt корректно failed, без зависания (fake-acp `AG_FAKE_HANG` writes truncated JSON-RPC line then blocks forever; session timeout fires → terminate_group + bounded reap `tokio::time::timeout(12s, child.wait())` so a child ignoring SIGTERM can't park `drive_acp_session` forever; test `drive_acp_session_hang_mid_frame_times_out`)
 
 **Exit 5:** Agentgrid node запускает ACP agent без agent-specific парсера; plan/tool/diff видны в UI.
